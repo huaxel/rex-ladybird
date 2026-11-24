@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""Control a running Ladybird from the command line.
+
+Two surfaces, both built into Ladybird, neither requiring a patch:
+
+  * the Firefox Remote Debugging Protocol server that --devtools=PORT starts,
+    which knows every tab's real URL and title and can evaluate JavaScript;
+  * the APC command channel terminal mode reads from its stdin,
+    ESC _ ladybird;<command>;<argument> ESC \\, which navigates, goes back and
+    forwards, reloads and quits.
+
+State lives in ~/.local/state/rex-ladybird/ (block id and devtools port), shared
+with the rex-ladybird module, so the CLI and the Rex pickers drive the same pane.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+STATE_DIR = os.path.join(HOME, ".local", "state", "rex-ladybird")
+BLOCK_FILE = os.path.join(STATE_DIR, "current")
+PORT_FILE = os.path.join(STATE_DIR, "port")
+
+
+# ---------------------------------------------------------------- Rex surface
+
+
+def block_id() -> str | None:
+    try:
+        with open(BLOCK_FILE) as file:
+            value = file.read().strip()
+    except OSError:
+        return None
+    return value or None
+
+
+def rex(*args: str, check: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(["rex", *args], capture_output=True, text=True, check=check)
+
+
+def terminal_write(payload: str) -> None:
+    block = block_id()
+    if not block:
+        sys.exit("no Ladybird pane recorded; open one with the Rex action ladybird_new")
+    result = rex("send", "-b", block, payload, check=False)
+    if result.returncode != 0:
+        sys.exit(f"could not write to {block}: {result.stderr.strip()}")
+
+
+def apc(command: str, argument: str = "") -> None:
+    terminal_write(f"\x1b_ladybird;{command};{argument}\x1b\\" if argument else f"\x1b_ladybird;{command}\x1b\\")
+
+
+def status_line_url() -> str | None:
+    """Read the address off the status line, for panes started without --devtools."""
+    block = block_id()
+    if not block:
+        return None
+    result = rex("capture", "-b", block, check=False)
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        if "● " in line and " — " in line:
+            tail = line.split(" — ", 1)[1].strip()
+            url = tail.split()[0] if tail else ""
+            if "://" in url:
+                return url
+    return None
+
+
+# ----------------------------------------------------------------- RDP client
+
+
+class RDP:
+    """Just enough of the Firefox Remote Debugging Protocol for browsing."""
+
+    def __init__(self, port: int, timeout: float = 10):
+        self.socket = socket.create_connection(("127.0.0.1", port), timeout=timeout)
+        self.buffer = b""
+        self.timeout = timeout
+        self.read_packet()  # the server's greeting
+
+    def close(self) -> None:
+        self.socket.close()
+
+    def read_packet(self) -> dict:
+        while b":" not in self.buffer:
+            chunk = self.socket.recv(65536)
+            if not chunk:
+                raise ConnectionError("devtools connection closed")
+            self.buffer += chunk
+        length, _, rest = self.buffer.partition(b":")
+        size = int(length)
+        while len(rest) < size:
+            chunk = self.socket.recv(65536)
+            if not chunk:
+                raise ConnectionError("devtools connection closed")
+            rest += chunk
+        self.buffer = rest[size:]
+        return json.loads(rest[:size])
+
+    def send(self, **packet) -> None:
+        to = packet.pop("to", "root")
+        body = json.dumps({"to": to, "type": packet.pop("type"), **packet}).encode()
+        self.socket.sendall(b"%d:" % len(body) + body)
+
+    def wait_for(self, predicate, timeout: float | None = None):
+        deadline = time.monotonic() + (timeout or self.timeout)
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            self.socket.settimeout(remaining)
+            try:
+                packet = self.read_packet()
+            except socket.timeout:
+                return None
+            if predicate(packet):
+                return packet
+
+    def request(self, **packet):
+        """Send a request and return the reply or error for that actor."""
+        to = packet.get("to", "root")
+        packet_type = packet.get("type")
+        self.send(**packet)
+        reply = self.wait_for(
+            lambda p: p.get("from") == to
+            and (p.get("type") == packet_type or "error" in p or ("resultID" not in p and p.get("type") is None))
+        )
+        if reply is None:
+            raise TimeoutError(f"no reply to {packet_type} from {to}")
+        return reply
+
+    def tab(self) -> dict:
+        reply = self.request(type="listTabs")
+        tabs = reply.get("tabs") or []
+        if not tabs:
+            raise RuntimeError("the browser has no open tab")
+        return tabs[0]
+
+    def frame(self) -> dict:
+        """The frame target plus its console and navigation actors."""
+        tab = self.tab()
+        watcher = self.request(to=tab["actor"], type="getWatcher")
+        if "actor" not in watcher:
+            raise RuntimeError(f"could not get a watcher: {watcher}")
+        self.send(to=watcher["actor"], type="watchTargets", targetType="frame")
+        packet = self.wait_for(lambda p: p.get("type") == "target-available-form")
+        if packet is None:
+            raise RuntimeError("the tab never offered a frame target")
+        return packet["target"]
+
+    def evaluate(self, script: str):
+        frame = self.frame()
+        console = frame["consoleActor"]
+        self.send(to=console, type="evaluateJSAsync", text=script)
+        ack = self.wait_for(lambda p: p.get("from") == console and "resultID" in p)
+        if ack is None:
+            raise RuntimeError("the console actor did not accept the script")
+        result = self.wait_for(
+            lambda p: p.get("from") == console and p.get("type") == "evaluationResult"
+            and p.get("resultID") == ack["resultID"]
+        )
+        if result is None:
+            raise RuntimeError("the console actor did not answer the script")
+        if result.get("hasException"):
+            raise RuntimeError(result.get("exceptionMessage") or "the script threw")
+        return result.get("result")
+
+
+# -------------------------------------------------------------------- helpers
+
+
+def devtools_port(explicit: int | None) -> int | None:
+    if explicit:
+        return explicit
+    from_environment = os.environ.get("LADYCTL_PORT")
+    if from_environment:
+        return int(from_environment)
+    try:
+        with open(PORT_FILE) as file:
+            return int(file.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def connect(explicit_port: int | None) -> RDP:
+    port = devtools_port(explicit_port)
+    if port is None:
+        sys.exit(
+            "no devtools port known: start Ladybird with --devtools=PORT "
+            f"or write the port to {PORT_FILE}"
+        )
+    try:
+        return RDP(port)
+    except OSError as error:
+        sys.exit(f"cannot reach the devtools server on {port}: {error}")
+
+
+def emit(args, payload) -> None:
+    if args.json:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    elif isinstance(payload, str):
+        print(payload)
+    else:
+        print(json.dumps(payload, ensure_ascii=False))
+
+
+# ------------------------------------------------------------------- commands
+
+
+def command_tabs(args) -> None:
+    connection = connect(args.port)
+    reply = connection.request(type="listTabs")
+    tabs = [
+        {"title": tab.get("title"), "url": tab.get("url"), "actor": tab.get("actor")}
+        for tab in reply.get("tabs") or []
+    ]
+    if args.json:
+        print(json.dumps(tabs, indent=2, ensure_ascii=False))
+    else:
+        for tab in tabs:
+            print(f"{tab['title'] or '(untitled)'} — {tab['url']}")
+
+
+def command_url(args) -> None:
+    try:
+        connection = connect(args.port)
+    except SystemExit:
+        url = status_line_url()
+        if url is None:
+            raise
+        emit(args, {"url": url, "source": "status-line"} if args.json else url)
+        return
+    url = connection.tab()["url"]
+    emit(args, {"url": url, "source": "devtools"} if args.json else url)
+
+
+def command_title(args) -> None:
+    connection = connect(args.port)
+    emit(args, connection.tab().get("title") or "")
+
+
+def command_open(args) -> None:
+    port = devtools_port(args.port)
+    if port is not None:
+        try:
+            connection = RDP(port)
+            reply = connection.request(to=connection.tab()["actor"], type="navigateTo", url=args.url)
+            if "error" not in reply:
+                connection.close()
+                emit(args, {"opened": args.url, "via": "devtools"})
+                return
+            connection.close()
+        except (OSError, RuntimeError, TimeoutError):
+            pass
+    apc("open", args.url)
+    emit(args, {"opened": args.url, "via": "apc"})
+
+
+def command_history(args) -> None:
+    connection = connect(args.port)
+    frame = connection.frame()
+    reply = connection.request(to=frame["actor"], type="goBack" if args.direction == "back" else "goForward")
+    if "error" in reply:
+        sys.exit(reply["error"])
+    emit(args, {"direction": args.direction})
+
+
+def command_reload(args) -> None:
+    connection = connect(args.port)
+    frame = connection.frame()
+    reply = connection.request(to=frame["actor"], type="reload")
+    if "error" in reply:
+        sys.exit(reply["error"])
+    emit(args, {"reloaded": True})
+
+
+def command_eval(args) -> None:
+    connection = connect(args.port)
+    emit(args, connection.evaluate(args.script))
+
+
+LINKS_SCRIPT = """JSON.stringify([...document.links]
+  .map(a => ({text: (a.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 120), href: a.href}))
+  .filter(a => a.href.startsWith('http'))
+  .slice(0, %d))"""
+
+
+def command_links(args) -> None:
+    connection = connect(args.port)
+    raw = connection.evaluate(LINKS_SCRIPT % args.limit) or "[]"
+    links = json.loads(raw)
+    title = connection.tab().get("title") or ""
+    if args.json:
+        print(json.dumps({"title": title, "links": links}, indent=2, ensure_ascii=False))
+        return
+    for link in links:
+        print(f"{link['text'] or '(no text)'} — {link['href']}")
+
+
+def command_click(args) -> None:
+    connection = connect(args.port)
+    script = f"(() => {{ const el = document.querySelector({json.dumps(args.selector)}); if (!el) return 'missing'; el.click(); return 'clicked'; }})()"
+    emit(args, connection.evaluate(script))
+
+
+def command_chrome(args) -> None:
+    """Ask terminal mode to hide or show its own status line (needs the status-line patch)."""
+    apc("chrome", "off" if args.state == "off" else "on")
+    emit(args, {"status_line": args.state})
+
+
+def command_quit(args) -> None:
+    port = devtools_port(args.port)
+    if port is not None:
+        try:
+            connection = RDP(port)
+            connection.send(to=connection.tab()["actor"], type="detach")
+            connection.close()
+        except OSError:
+            pass
+    apc("quit")
+    emit(args, {"quit": True})
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--port", type=int, help="devtools port (default: the one the Rex module recorded)")
+    parser.add_argument("--json", action="store_true", help="print machine-readable output")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def add(name, help_text, handler, **kwargs):
+        sub = subparsers.add_parser(name, help=help_text, **kwargs)
+        # SUPPRESS keeps the top-level --port/--json when they are given before the subcommand.
+        sub.add_argument("--port", type=int, default=argparse.SUPPRESS, help="devtools port")
+        sub.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print machine-readable output")
+        sub.set_defaults(handler=handler)
+        return sub
+
+    add("tabs", "list the open tabs with their real titles and URLs", command_tabs)
+    add("url", "print the current address", command_url)
+    add("title", "print the current page title", command_title)
+    add("open", "navigate to a URL", command_open).add_argument("url")
+    history = add("back", "go back in history", command_history)
+    history.set_defaults(direction="back")
+    forward = add("forward", "go forward in history", command_history)
+    forward.set_defaults(direction="forward")
+    add("reload", "reload the page", command_reload)
+    add("eval", "evaluate JavaScript in the page", command_eval).add_argument("script")
+    add("links", "list the links on the page", command_links).add_argument(
+        "--limit", type=int, default=200, help="how many links to report (default 200)"
+    )
+    add("click", "click the first element matching a CSS selector", command_click).add_argument("selector")
+    chrome = add("chrome", "hide or show terminal mode's own status line", command_chrome)
+    chrome.add_argument("state", choices=["on", "off"])
+    add("quit", "close the browser", command_quit)
+
+    args = parser.parse_args()
+    try:
+        args.handler(args)
+    except (RuntimeError, TimeoutError, ConnectionError) as error:
+        sys.exit(str(error))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

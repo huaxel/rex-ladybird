@@ -1,0 +1,15 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua, Python and shellcheck
+        run: sudo apt-get update && sudo apt-get install -y luajit python3 shellcheck
+      - name: Run the checks
+        run: bash test/run.sh
