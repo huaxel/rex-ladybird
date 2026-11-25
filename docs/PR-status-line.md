@@ -1,5 +1,12 @@
 # LibWebView: Let terminal mode give up its status line
 
+This is a proposal, not a pull request. Ladybird's `CONTRIBUTING.md` is explicit that the
+project "do[es] not accept pull requests from non-maintainers and do[es] not allow code
+change proposals through any other route", so nothing was sent upstream. The branch lives
+in the fork at `huaxel/ladybird` (`terminal-status-line-toggle`, rebased on current
+`master`) as a reference implementation; the discussion belongs on the project's Discord,
+where their contribution guide points design discussion.
+
 ## Why
 
 Terminal mode reserves the bottom row for its own status line: the page title and URL,
@@ -45,8 +52,8 @@ command reports `status line on`/`off` as a notice when it is visible.
 - `chrome off` on a build without this change is answered with the existing
   `unknown command: chrome` notice, so a client can probe for support.
 
-Branch: `terminal-status-line-toggle` in `~/projects/ladybird`, commit
-`LibWebView: Allow terminal mode to hide its status line`.
+Commit: `LibWebView: Allow terminal mode to hide its status line`, kept in
+`patch/ladybird-status-line.patch` and rebased onto upstream `master`.
 
 ## Checks
 

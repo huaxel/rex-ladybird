@@ -226,9 +226,11 @@ that makes it optional:
 - with it off the page fills the whole pane, and `ctrl-l` is swallowed instead of
   opening a prompt that would be typed blind.
 
-The change is written against the Ladybird revision in `docs/PR-status-line.md`, where
-the description for the upstream pull request also lives. Apply it to a checkout at that
-revision and rebuild:
+Ladybird does not accept pull requests from non-maintainers
+([`CONTRIBUTING.md`](https://github.com/LadybirdBrowser/ladybird/blob/master/CONTRIBUTING.md)),
+so this stays a local patch: `docs/PR-status-line.md` is the proposal, and a branch with
+the same commit sits in [the fork](https://github.com/huaxel/ladybird/tree/terminal-status-line-toggle)
+as a reference. Apply it to a checkout and rebuild:
 
 ```sh
 cd path/to/ladybird
