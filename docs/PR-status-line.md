@@ -45,6 +45,9 @@ command reports `status line on`/`off` as a notice when it is visible.
 - `chrome off` on a build without this change is answered with the existing
   `unknown command: chrome` notice, so a client can probe for support.
 
+Branch: `terminal-status-line-toggle` in `~/projects/ladybird`, commit
+`LibWebView: Allow terminal mode to hide its status line`.
+
 ## Checks
 
 Built `Meta/ladybird.py build` (Release) on macOS 27.2 arm64 from `eae01b006b` and ran

@@ -1,5 +1,5 @@
 diff --git a/Libraries/LibWebView/TerminalWebView.cpp b/Libraries/LibWebView/TerminalWebView.cpp
-index 63e8c5a..d13f183 100644
+index 63e8c5a0fa..d13f183145 100644
 --- a/Libraries/LibWebView/TerminalWebView.cpp
 +++ b/Libraries/LibWebView/TerminalWebView.cpp
 @@ -236,7 +236,7 @@ void TerminalWebView::apply_pane_geometry()
@@ -69,14 +69,16 @@ index 63e8c5a..d13f183 100644
      if (m_url_prompt_text.has_value()) {
          text.appendff(" Go to: {}█", *m_url_prompt_text);
 diff --git a/Libraries/LibWebView/TerminalWebView.h b/Libraries/LibWebView/TerminalWebView.h
-index f64bc4a..bd1728b 100644
+index f64bc4a3c9..1b677183ae 100644
 --- a/Libraries/LibWebView/TerminalWebView.h
 +++ b/Libraries/LibWebView/TerminalWebView.h
-@@ -41,7 +41,10 @@ private:
+@@ -40,8 +40,11 @@ private:
+ 
          int cell_width() const { return columns > 0 ? pixel_size.width() / columns : 0; }
          int cell_height() const { return rows > 0 ? pixel_size.height() / rows : 0; }
-         // Everything but the last row, which holds the status line.
+-        // Everything but the last row, which holds the status line.
 -        Gfx::IntSize page_pixel_size() const { return { columns * cell_width(), (rows - 1) * cell_height() }; }
++        // The last row holds the status line, unless the client draws its own.
 +        Gfx::IntSize page_pixel_size(bool reserve_status_line = true) const
 +        {
 +            return { columns * cell_width(), (rows - (reserve_status_line ? 1 : 0)) * cell_height() };

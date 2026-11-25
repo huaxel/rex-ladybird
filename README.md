@@ -141,7 +141,10 @@ width and the DevTools server requires a port and a second connection.
 
 A tab is a Ladybird block: `ladybird_tab_new` splits beside the active tab, gives the
 new block its own DevTools port, and records `block_id<TAB>port<TAB>url` in
-`~/.local/state/rex-ladybird/tabs`. Every tab is its own process but they all share
+`${XDG_STATE_HOME:-~/.local/state}/rex-ladybird/tabs`. A pane opened with
+`ladybird_new` is the same thing without the zoom, so both appear in the picker and
+neither reuses a port. Entries whose block has left its window are dropped when the
+registry is read, so closing a pane by hand needs no cleanup. Every tab is its own process but they all share
 one `--profile-path`, and therefore one cookie jar: headless instances skip the
 profile coordination the GUI does, so nothing refuses the second one. Measured on
 this machine: three tabs, three processes, one profile, all live at once.
@@ -170,7 +173,10 @@ that makes it optional:
 - with it off the page fills the whole pane, and `ctrl-l` is swallowed instead of
   opening a prompt that would be typed blind.
 
-Apply with `git apply` in a Ladybird checkout and rebuild:
+The change is committed on a branch in `~/projects/ladybird` as
+`LibWebView: Allow terminal mode to hide its status line`
+(`terminal-status-line-toggle`), and `docs/PR-status-line.md` holds the description to
+open it upstream. Apply it to any checkout with `git apply` and rebuild:
 
 ```sh
 cd ~/projects/ladybird && git apply ~/projects/rex-ladybird/patch/ladybird-status-line.patch
