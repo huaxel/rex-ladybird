@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Runs the Lua tests against a fake Rex, the CLI tests against a fake DevTools
-# server, then shellcheck on the helpers in bin/.
+# server, the installer against a temporary account and a `rex` that only
+# answers, then shellcheck on the shell in bin/ and at the root.
 # Exits non-zero if any of them fails.
 #
 #   bash test/run.sh
@@ -34,7 +35,7 @@ else
 fi
 
 if command -v shellcheck >/dev/null 2>&1; then
-    step shellcheck shellcheck test/*.sh
+    step shellcheck shellcheck test/*.sh install.sh
 else
     echo "skip: shellcheck is not installed"
 fi
@@ -45,5 +46,7 @@ step "ladyctl --help" python3 bin/ladyctl --help
 # The CLI's exit codes are the interface a script or an agent reads, so they are
 # pinned against a fake DevTools server rather than left to a live browser.
 step "ladyctl contract" python3 test/ladyctl_test.py
+# The installer edits a file the user cannot lose, so its rollback is pinned too.
+step "install.sh contract" bash test/install_test.sh
 
 exit $failed

@@ -27,14 +27,19 @@ wheel. Scripts and agents get the same browser from the command line, without Re
 
 ```sh
 git clone https://github.com/huaxel/rex-ladybird ~/projects/rex-ladybird
-ln -sfn ~/projects/rex-ladybird ~/.config/rex/rex-ladybird
-ln -sfn ~/projects/rex-ladybird/bin/ladyctl ~/.local/bin/ladyctl
+cd ~/projects/rex-ladybird && ./install.sh
 ```
 
-In `~/.config/rex/init.lua`:
+That links the checkout where Rex looks for a module, links `ladyctl` into
+`~/.local/bin`, and adds the load line to `~/.config/rex/init.lua`. It asks nothing and
+is safe to run again after a `git pull`. Before it keeps that line it runs
+`rex config check`, and if Rex rejects the result the file is restored: a config that
+no longer loads costs you every key you had. `PREFIX` moves the symlinks somewhere else
+on `PATH`, `REX_CONFIG` installs into another account's config file.
+
+Then the keys, in the same `~/.config/rex/init.lua`:
 
 ```lua
-require("rex-ladybird").setup{}
 rex.bind("ctrl+b>w", "ladybird_open")
 rex.bind("ctrl+b>l", "ladybird_new")
 rex.bind("ctrl+b>u", "ladybird_url")
