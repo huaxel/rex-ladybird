@@ -3,8 +3,9 @@
 Rex integration for Ladybird's terminal mode (`--headless=terminal`). Rex owns the
 pickers and the layout; Ladybird owns the page.
 
-The usage guide for people and agents lives in the shared skill catalog:
-`~/dotfiles/skills/rex-ladybird/SKILL.md`, with the full command reference beside it.
+`ctrl+b w` picks an address from your browser history and loads it in the pane. From
+there it is an ordinary browser: click links, `alt+←` to go back, scroll with the
+wheel. Scripts and agents get the same browser from the command line, without Rex.
 
 ## What you need
 
