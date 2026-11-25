@@ -482,6 +482,9 @@ end
 function M.launch(ctx, url)
   if not url then url = pick_url(nil, "Ladybird: open in a new pane") end
   if not url then return { opened = false, reason = "cancelled" } end
+  -- Its own DevTools port and its own line in the registry: a pane opened here is
+  -- a tab too, so the picker lists it and two panes never fight over one port.
+  local port = next_free_port()
   local pane, err = rex.session.new_split{
     anchor_id = ctx.block_id,
     direction = "horizontal",
@@ -491,15 +494,20 @@ function M.launch(ctx, url)
     layout = rex.layout.block{
       flavor = "com.superlogical.terminal.shell",
       label = M.options.label,
-      options = { command = ladybird_command(url) },
+      options = { command = ladybird_command(url, port) },
     },
   }
   if not pane then raise("could not open a Ladybird pane: " .. tostring(err)) end
   local block_id = pane.block_id or (pane.block_ids and pane.block_ids[1]) or pane.id
-  if block_id then remember_block(block_id) end
-  remember_port(M.options.devtools_port)
+  if not block_id then raise("the new pane has no block") end
+
+  local tabs = read_tabs()
+  tabs[#tabs + 1] = { block_id = block_id, port = port, url = url }
+  write_tabs(tabs)
+  remember_block(block_id)
+  remember_port(port)
   maybe_hide_status_line(block_id)
-  return { opened = true, block_id = block_id, url = url }
+  return { opened = true, block_id = block_id, port = port, url = url }
 end
 
 function M.url(ctx)

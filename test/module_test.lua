@@ -98,6 +98,28 @@ do
     tostring(data) .. " to " .. tostring(block_id))
 end
 
+t.section("a launched pane is a tab: its own port, its own registry line")
+do
+  local M = fresh()
+  local first = M.launch({ block_id = "block:1" }, "https://example.com/one")
+  t.check("the first pane gets the first port", first.port == 9317, first.port)
+  t.check("and is recorded as a tab",
+    t.read_file(tabs_file()) == "block:2\t9317\thttps://example.com/one\n", t.read_file(tabs_file()))
+
+  -- A second pane must not be handed the same port: its DevTools server would fail
+  -- to bind and ladyctl would talk to the wrong browser.
+  local session = fake.sessions[1]
+  fake:add_block(session, "block:5", "Ladybird")
+  fake.split_result = { block_id = "block:5" }
+  fake.process["block:5"] = { foreground = { argv0 = "/tmp/Ladybird.app/Contents/MacOS/Ladybird" } }
+  local second = M.launch({ block_id = "block:1" }, "https://example.com/two")
+  t.check("the second pane gets a different port", second.port == 9318, second.port)
+  local lines = t.read_file(tabs_file())
+  t.check("both panes are listed", lines:find("block:2\t9317", 1, true) and lines:find("block:5\t9318", 1, true), lines)
+  t.check("the recorded port follows the latest pane", t.read_file(state_dir() .. "/port") == "9318\n",
+    t.read_file(state_dir() .. "/port"))
+end
+
 t.section("hiding the status line is optional")
 do
   local M = fresh({ hide_status_line = false })
