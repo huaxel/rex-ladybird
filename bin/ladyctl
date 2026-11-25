@@ -23,6 +23,7 @@ import socket
 import subprocess
 import sys
 import time
+from textwrap import indent
 
 HOME = os.path.expanduser("~")
 # The same directory the Rex module writes: ${XDG_STATE_HOME:-~/.local/state}.
@@ -160,6 +161,7 @@ class RDP:
         self.socket = socket.create_connection(("127.0.0.1", port), timeout=timeout)
         self.buffer = b""
         self.timeout = timeout
+        self.console_actor: str | None = None
         self.read_packet()  # the server's greeting
 
     def close(self) -> None:
@@ -232,9 +234,14 @@ class RDP:
             raise RuntimeError("the tab never offered a frame target")
         return packet["target"]
 
+    def console(self) -> str:
+        """The console actor, asked for once: every script goes through it."""
+        if self.console_actor is None:
+            self.console_actor = self.frame()["consoleActor"]
+        return self.console_actor
+
     def evaluate(self, script: str):
-        frame = self.frame()
-        console = frame["consoleActor"]
+        console = self.console()
         self.send(to=console, type="evaluateJSAsync", text=script)
         ack = self.wait_for(lambda p: p.get("from") == console and "resultID" in p)
         if ack is None:
@@ -250,6 +257,29 @@ class RDP:
         if result.get("hasException"):
             raise RuntimeError(result.get("exceptionMessage") or "the script threw")
         return result.get("result")
+
+    def evaluate_value(self, source: str, timeout: float = 30):
+        """Evaluate an expression, or a function body when it uses statements,
+        await whatever it returns, and give back the value as JSON data.
+
+        Ladybird answers a script once, so an awaited value cannot arrive in the
+        same packet: the script parks its answer on window and a second request
+        collects it.
+        """
+        key = f"__ladyctl_{os.getpid()}_{int(time.time() * 1000)}"
+        body = indent(source if is_statements(source) else f"return (\n{source}\n);", "    ")
+        self.evaluate(EVALUATION_SETUP % (json.dumps(key), body))
+        deadline = time.monotonic() + timeout
+        while True:
+            parked = self.evaluate(EVALUATION_COLLECT % json.dumps(key))
+            if isinstance(parked, str):
+                answer = json.loads(parked)
+                if "err" in answer:
+                    raise RuntimeError(answer["err"])
+                return answer.get("ok")
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"the page did not finish within {timeout:g}s")
+            time.sleep(0.05)
 
 
 # -------------------------------------------------------------------- helpers
@@ -363,9 +393,67 @@ def command_reload(args) -> None:
     emit(args, {"reloaded": True})
 
 
+# A script is either an expression or a function body. `return` and `const` say
+# which without a JavaScript parser; so does a `;` that ends a statement rather
+# than sitting inside brackets or a string.
+STATEMENT_START = re.compile(r"\s*(const|let|var|if|for|while|do|try|throw|switch|function|class|return|await|import|export)\b")
+
+
+def is_statements(source: str) -> bool:
+    if STATEMENT_START.match(source):
+        return True
+    depth = 0
+    index = 0
+    while index < len(source):
+        character = source[index]
+        if character in "'\"`":
+            index += 1
+            while index < len(source) and source[index] != character:
+                index += 2 if source[index] == "\\" else 1
+        elif source.startswith("//", index):
+            newline = source.find("\n", index)
+            index = len(source) if newline < 0 else newline
+        elif source.startswith("/*", index):
+            end = source.find("*/", index)
+            index = len(source) if end < 0 else end + 2
+        elif character in "([{":
+            depth += 1
+        elif character in ")]}":
+            depth -= 1
+        elif depth == 0 and character == ";" and source[index + 1:].strip():
+            return True
+        elif depth == 0 and re.match(r"\breturn\b", source[index:]) and (
+            index == 0 or not (source[index - 1].isalnum() or source[index - 1] in "_$")
+        ):
+            return True
+        index += 1
+    return False
+
+
+EVALUATION_SETUP = """(() => {
+  const key = %s;
+  window[key] = undefined;
+  (async () => {
+%s
+  })().then(
+    value => { window[key] = JSON.stringify({ok: value === undefined ? null : value}); },
+    error => { window[key] = JSON.stringify({err: String((error && error.message) || error)}); });
+  return key;
+})()"""
+
+EVALUATION_COLLECT = """(() => {
+  const key = %s;
+  const value = window[key];
+  if (value === undefined) return null;
+  delete window[key];
+  return value;
+})()"""
+
+
 def command_eval(args) -> None:
     connection = connect(args)
-    emit(args, connection.evaluate(args.script))
+    source = sys.stdin.read() if args.script == "-" else args.script
+    emit(args, connection.evaluate_value(source, args.timeout))
 
 
 LINKS_SCRIPT = """JSON.stringify([...document.links]
@@ -703,7 +791,10 @@ def main() -> int:
     forward = add("forward", "go forward in history", command_history)
     forward.set_defaults(direction="forward")
     add("reload", "reload the page", command_reload)
-    add("eval", "evaluate JavaScript in the page", command_eval).add_argument("script")
+    evaluation = add("eval", "evaluate JavaScript in the page: an expression or statements, awaiting promises",
+                     command_eval)
+    evaluation.add_argument("script", help="the script, or - to read it from stdin")
+    evaluation.add_argument("--timeout", type=float, default=30, help="seconds to wait for the value (default 30)")
     add("links", "list the links on the page", command_links).add_argument(
         "--limit", type=int, default=200, help="how many links to report (default 200)"
     )

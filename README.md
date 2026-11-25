@@ -150,6 +150,8 @@ ladyctl url | title     # current page
 ladyctl links --limit 50
 ladyctl snapshot        # number the controls (e1, e2, …) and read the page text
 ladyctl eval 'document.querySelectorAll("a").length'
+ladyctl eval 'const ids = [...document.images].map(i => i.src); return ids.length'
+ladyctl eval 'await new Promise(r => setTimeout(r, 500)); return document.title'
 ladyctl click e2        # a ref from the last snapshot, or any CSS selector
 ladyctl type e1 'ladybird browser' --clear --submit
 ladyctl press tab enter
@@ -187,15 +189,20 @@ the whole page as one object, and `--list` prints one control per line —
 field through the page, so autocomplete, validation and framework models see the
 same events a person's typing produces.
 
+`eval` takes an expression or a function body, so `const n = 2; return n * 21` works,
+and it awaits: `await new Promise(r => setTimeout(r, 50)); return 'done'` comes back
+as `done`. A script that throws exits 1 with the error's own message; a script with a
+syntax error exits 1 with `no evaluation result`, because Ladybird sends nothing at all
+for a script it cannot compile, and a missing answer and a dead console look alike from
+the client.
+
 Exit status is meant for scripts: an unreachable DevTools server exits 1 with
 `cannot reach the devtools server on PORT`, `click` exits 1 with
 `no element matches SELECTOR` instead of reporting a silent no-op, `click e3`
-exits 1 with `no element e3` when the snapshot is older than the page, and `eval`
-exits 1 with `no evaluation result` when the script throws — Ladybird sends no
-`evaluationResult` in that case, so an exception and a dead console look alike
-from the client. `type` refuses to type when the field did not take focus rather
-than sending the text to whatever has it, and `wait` names what it waited for and
-how long: `waited 10s for the page to mention "Saved"`.
+exits 1 with `no element e3` when the snapshot is older than the page, and `-b`
+exits 1 when the target names no pane or two. `type` refuses to type when the field
+did not take focus rather than sending the text to whatever has it, and `wait` names
+what it waited for and how long: `waited 10s for the page to mention "Saved"`.
 
 ## The two surfaces, and what each is good for
 

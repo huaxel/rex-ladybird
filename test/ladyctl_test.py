@@ -113,14 +113,18 @@ class FakeDevTools:
                 "target": {"actor": FRAME_ACTOR, "consoleActor": CONSOLE_ACTOR},
             })
         elif kind == "evaluateJSAsync":
-            self.scripts.append(packet.get("text", ""))
+            script = packet.get("text", "")
+            self.scripts.append(script)
+            # A caller may answer per script, which is how the two-request shape
+            # of `eval` is modelled: setup, then collection.
+            value = self.answers(script) if callable(self.answers) else self.answers
             self.send(connection, {"from": CONSOLE_ACTOR, "resultID": "result-1"})
             if self.with_result:
                 self.send(connection, {
                     "from": CONSOLE_ACTOR,
                     "type": "evaluationResult",
                     "resultID": "result-1",
-                    "result": self.answers,
+                    "result": value,
                     "hasException": False,
                 })
         else:
@@ -128,15 +132,29 @@ class FakeDevTools:
 
 
 class LadyctlTests(unittest.TestCase):
-    def run_cli(self, *arguments: str, port: int | None = None, environment: dict | None = None) -> subprocess.CompletedProcess:
+    def run_cli(
+        self, *arguments: str, port: int | None = None, environment: dict | None = None, stdin_text: str | None = None
+    ) -> subprocess.CompletedProcess:
         environment = dict(os.environ if environment is None else environment)
         environment.pop("LADYCTL_PORT", None)
         return subprocess.run(
             [sys.executable, str(LADYCTL)]
             + ([] if port is None else ["--port", str(port)])
             + list(arguments),
-            capture_output=True, text=True, timeout=60, env=environment,
+            capture_output=True, text=True, timeout=60, env=environment, input=stdin_text,
         )
+
+    @staticmethod
+    def parked(value=None, error=None):
+        """The two requests `eval` makes: the setup returns its key, and the
+        collection returns the envelope the script parked on window."""
+
+        def answer(script: str):
+            if "window[key] = undefined" in script:
+                return "key"
+            return json.dumps({"err": error} if error is not None else {"ok": value})
+
+        return answer
 
     def test_click_reports_the_click(self) -> None:
         fake = FakeDevTools(answers="clicked")
@@ -168,7 +186,7 @@ class LadyctlTests(unittest.TestCase):
         self.assertIn("no evaluation result", result.stderr)
 
     def test_eval_prints_the_value(self) -> None:
-        fake = FakeDevTools(answers="Example Domain")
+        fake = FakeDevTools(answers=self.parked("Example Domain"))
         try:
             result = self.run_cli("eval", "document.title", port=fake.port)
         finally:
@@ -177,13 +195,54 @@ class LadyctlTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), "Example Domain")
 
     def test_json_output_is_machine_readable(self) -> None:
-        fake = FakeDevTools(answers="Example Domain")
+        fake = FakeDevTools(answers=self.parked("Example Domain"))
         try:
             result = self.run_cli("--json", "eval", "document.title", port=fake.port)
         finally:
             fake.close()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), "Example Domain")
+
+    def test_eval_runs_statements(self) -> None:
+        fake = FakeDevTools(answers=self.parked(3))
+        try:
+            result = self.run_cli("eval", "const n = 2; return n + 1", port=fake.port)
+        finally:
+            fake.close()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "3")
+        self.assertIn("const n = 2;", fake.scripts[0], "the statements are passed through, not wrapped as an expression")
+
+    def test_eval_awaits_a_promise(self) -> None:
+        fake = FakeDevTools(answers=self.parked("late"))
+        try:
+            script = "await new Promise(resolve => setTimeout(resolve, 10)); return 'late'"
+            result = self.run_cli("eval", script, port=fake.port)
+        finally:
+            fake.close()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "late")
+        self.assertIn("async", fake.scripts[0])
+
+    def test_eval_reports_what_the_script_threw(self) -> None:
+        # A thrown error is the caller's answer, not a dead console.
+        fake = FakeDevTools(answers=self.parked(error="boom"))
+        try:
+            result = self.run_cli("eval", "throw new Error('boom')", port=fake.port)
+        finally:
+            fake.close()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("boom", result.stderr)
+
+    def test_eval_reads_the_script_from_stdin(self) -> None:
+        fake = FakeDevTools(answers=self.parked("Example Domain"))
+        try:
+            result = self.run_cli("eval", "-", port=fake.port, stdin_text="document.title\n")
+        finally:
+            fake.close()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "Example Domain")
+        self.assertIn("document.title", fake.scripts[0])
 
     def test_the_state_directory_follows_xdg(self) -> None:
         # The module honours XDG_STATE_HOME, so the CLI has to read the port from
