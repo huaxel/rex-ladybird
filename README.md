@@ -11,7 +11,10 @@ wheel. Scripts and agents get the same browser from the command line, without Re
 
 - **Rex**, the terminal multiplexer (0.1.0-preview or newer). This is a Rex module: it
   uses `rex.ui.pick`, `rex.session.new_split` and the action registry, so without Rex it
-  does nothing.
+  does nothing. Rex is in preview and is not installable from this repository — if you
+  do not already run it, read this as a worked example rather than a drop-in. The two
+  browser surfaces it drives (the APC command channel and the DevTools subset) are
+  documented below and are useful on their own, with any terminal client.
 - **A Ladybird build with terminal mode** (`--headless=terminal`). A source build — the
   release app does not have it. Looked for in `~/projects/ladybird`, `~/ladybird`,
   `~/src/ladybird` and `/Applications/Ladybird.app`, then `ladybird` on `PATH`;
