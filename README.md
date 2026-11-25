@@ -6,6 +6,47 @@ pickers and the layout; Ladybird owns the page.
 The usage guide for people and agents lives in the shared skill catalog:
 `~/dotfiles/skills/rex-ladybird/SKILL.md`, with the full command reference beside it.
 
+## What you need
+
+- **Rex**, the terminal multiplexer (0.1.0-preview or newer). This is a Rex module: it
+  uses `rex.ui.pick`, `rex.session.new_split` and the action registry, so without Rex it
+  does nothing.
+- **A Ladybird build with terminal mode** (`--headless=terminal`). A source build — the
+  release app does not have it. Looked for in `~/projects/ladybird`, `~/ladybird`,
+  `~/src/ladybird` and `/Applications/Ladybird.app`, then `ladybird` on `PATH`;
+  `LADYBIRD_BINARY` overrides all of it.
+- **A terminal that draws graphics** with the Kitty graphics protocol — kitty, ghostty,
+  wezterm. Terminal mode sends the page as images; elsewhere there is nothing to see.
+- **python3** for `bin/ladyctl` and the optional cookie importer.
+
+## Install
+
+```sh
+git clone https://github.com/huaxel/rex-ladybird ~/projects/rex-ladybird
+ln -sfn ~/projects/rex-ladybird ~/.config/rex/rex-ladybird
+ln -sfn ~/projects/rex-ladybird/bin/ladyctl ~/.local/bin/ladyctl
+```
+
+In `~/.config/rex/init.lua`:
+
+```lua
+require("rex-ladybird").setup{}
+rex.bind("ctrl+b>w", "ladybird_open")
+rex.bind("ctrl+b>l", "ladybird_new")
+rex.bind("ctrl+b>u", "ladybird_url")
+rex.bind("ctrl+b>k", "ladybird_links")
+rex.bind("ctrl+b>n", "ladybird_tab_new")
+rex.bind("ctrl+b>b", "ladybird_tabs")
+rex.bind("ctrl+b>x", "ladybird_tab_close")
+```
+
+Then `rex config reload`. `rex keymap` should list the seven bindings; if they are
+missing, the module was not found on Rex's `package.path` — the symlink above is what
+puts it there.
+
+The module locates `bin/ladyctl` beside itself, so a checkout works without the second
+symlink; it falls back to `~/.local/bin/ladyctl` for a config-directory install.
+
 ## Why
 
 Ladybird's terminal mode already renders a real page in a Rex pane and exposes a
@@ -49,35 +90,33 @@ Detection asks the terminal what the block is running
 (`com.superlogical.terminal.process`, matching `Ladybird`/`Ladybird.app`) rather
 than scraping the status line, which is truncated to the pane width.
 
-## Install
+## Options
 
-```sh
-git clone <this repo> ~/projects/rex-ladybird
-ln -sfn ~/projects/rex-ladybird ~/.config/rex/rex-ladybird
-ln -sfn ~/projects/rex-ladybird/bin/ladyctl ~/.local/bin/ladyctl
-```
+| option | default | meaning |
+| --- | --- | --- |
+| `binary` | `LADYBIRD_BINARY`, then the build paths above | the terminal-mode executable |
+| `profile` | `${XDG_DATA_HOME:-~/.local/share}/ladybird-terminal-profile` | `--profile-path`, a persistent profile |
+| `device_pixel_ratio` | `2` | passed through to the renderer |
+| `label` | `"Ladybird"` | the pane label used for detection |
+| `chrome_history` | the first Chrome-family `History` that exists | picker source; a missing file is an empty history |
+| `history_items` | `400` | how many visits the picker offers |
+| `devtools_port` | `9317` | first port of the range panes allocate from |
+| `ladyctl` | `bin/ladyctl` beside the module | the CLI |
+| `hide_status_line` | `true` | needs the patch below; harmless otherwise |
 
-The module finds `bin/ladyctl` beside itself, so a checkout works without the second
-symlink; it falls back to `~/.local/bin/ladyctl` for a config-directory install.
-
-## Setup
-
-```lua
--- ~/.config/rex/init.lua
-require("rex-ladybird").setup{}
-rex.bind("ctrl+b>w", "ladybird_open")
-rex.bind("ctrl+b>l", "ladybird_new")
-rex.bind("ctrl+b>u", "ladybird_url")
-```
-
-Options: `binary`, `profile` (the `--profile-path` directory), `device_pixel_ratio`,
-`label`, `chrome_history`, `history_items`, `devtools_port`, `ladyctl`,
-`hide_status_line`. The profile must be the persistent one;
-`--temporary-profile` throws cookies away on exit. State lives in
-`${XDG_STATE_HOME:-~/.local/state}/rex-ladybird`.
+State lives in `${XDG_STATE_HOME:-~/.local/state}/rex-ladybird`. Passing
+`--temporary-profile` is deliberately not an option: it throws cookies away on exit.
 
 Launching a pane uses `--profile-path`, never `--profile NAME` — named profiles are
 not created in headless mode (it makes an empty directory and no database).
+
+## Platform
+
+macOS is where this was built and measured. Linux should work and has not been run:
+the module reads XDG directories, finds `wl-copy`, `xclip` or `xsel` for the clipboard,
+and looks for Chrome, Chromium, Brave and Edge histories under `~/.config`.
+`bin/ladybird-import-chrome-cookies` decrypts with the macOS Keychain, so importing
+cookies is macOS-only. Windows is untested.
 
 ## Known limits
 
@@ -183,13 +222,13 @@ that makes it optional:
 - with it off the page fills the whole pane, and `ctrl-l` is swallowed instead of
   opening a prompt that would be typed blind.
 
-The change is committed on a branch in `~/projects/ladybird` as
-`LibWebView: Allow terminal mode to hide its status line`
-(`terminal-status-line-toggle`), and `docs/PR-status-line.md` holds the description to
-open it upstream. Apply it to any checkout with `git apply` and rebuild:
+The change is written against the Ladybird revision in `docs/PR-status-line.md`, where
+the description for the upstream pull request also lives. Apply it to a checkout at that
+revision and rebuild:
 
 ```sh
-cd ~/projects/ladybird && git apply ~/projects/rex-ladybird/patch/ladybird-status-line.patch
+cd path/to/ladybird
+git apply path/to/rex-ladybird/patch/ladybird-status-line.patch
 ./Meta/ladybird.py build
 ```
 
@@ -198,11 +237,11 @@ Built and measured here: the page area grows by exactly one text row
 and `ctrl-l` is swallowed while hidden. `ladyctl chrome off` sends the command, and an
 unpatched browser answers with an `unknown command: chrome` notice.
 
-This module uses `~/projects/ladybird/Build/release/bin/Ladybird.app` when it exists and
-falls back to `/Applications/Ladybird.app`, with `hide_status_line = true` sending
-`chrome off` to each new pane. Set either option to change that.
+The module sends `chrome off` to each new pane while `hide_status_line` is true, so an
+unpatched browser loses nothing but five seconds of notice.
 
-Build prerequisites that were missing on this machine (macOS, arm64): the autotools
+Build prerequisites that were missing on the machine this was developed on (macOS,
+arm64): the autotools
 vcpkg wants for `gperf`/`skia` (`brew install autoconf autoconf-archive automake
 libtool make`), a `libtoolize` shim so Apple's `libtool` stays first on `PATH` (skia
 links with `libtool -static`), and the pinned Rust toolchain from `rust-toolchain.toml`
@@ -225,3 +264,17 @@ the Python helpers compile.
 
 Not covered: the patch itself (needs a compiled browser — see the build recipe above),
 and anything that requires Rex to actually lay out panes.
+
+## Contributing
+
+`bash test/run.sh` runs everything the repository can check without a browser: the Lua
+suite against a fake Rex, the CLI against a fake DevTools server, a scope check and
+shellcheck. CI runs the same script on Linux and macOS. Bug reports are most useful when
+they say which of the two surfaces failed — `ladyctl url` answering while the pane shows
+nothing is a different problem from neither answering.
+
+## License
+
+MIT, see `LICENSE`. `patch/ladybird-status-line.patch` is a diff against
+[Ladybird](https://github.com/LadybirdBrowser/ladybird), which is BSD-2-Clause: the
+patched files stay Ladybird's, and the patch is offered under their terms.

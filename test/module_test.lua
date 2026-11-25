@@ -313,4 +313,70 @@ do
     tostring(err2))
 end
 
+t.section("on a machine that is not this one: defaults are discovered, not hardcoded")
+do
+  -- The defaults are computed when the module is loaded, from the environment
+  -- and the filesystem, so this reads a second copy of init.lua with a HOME
+  -- that has never seen this checkout.
+  local function load_defaults()
+    fake:reset()
+    return dofile(t.root .. "/init.lua")
+  end
+
+  os.execute("mkdir -p '" .. fake.tmp .. "/home/.config/google-chrome/Default'")
+  os.execute(": > '" .. fake.tmp .. "/home/.config/google-chrome/Default/History'")
+  -- `false` makes the getenv shim answer nil rather than falling through to the
+  -- real environment, which on this machine does define XDG_DATA_HOME.
+  fake.env.LADYBIRD_BINARY = false
+  fake.env.XDG_DATA_HOME = false
+  local M = load_defaults()
+  t.check("the Chrome history that exists is the one used",
+    M.options.chrome_history == fake.tmp .. "/home/.config/google-chrome/Default/History", M.options.chrome_history)
+  t.check("the profile follows XDG_DATA_HOME's fallback",
+    M.options.profile == fake.tmp .. "/home/.local/share/ladybird-terminal-profile", M.options.profile)
+
+  fake.env.XDG_DATA_HOME = fake.tmp .. "/xdg-data"
+  M = load_defaults()
+  t.check("the profile moves with XDG_DATA_HOME",
+    M.options.profile == fake.tmp .. "/xdg-data/ladybird-terminal-profile", M.options.profile)
+
+  fake.env.LADYBIRD_BINARY = "/opt/ladybird/Ladybird"
+  M = load_defaults()
+  t.check("LADYBIRD_BINARY overrides every guess", M.options.binary == "/opt/ladybird/Ladybird", M.options.binary)
+  fake.env.LADYBIRD_BINARY = false
+  fake.env.XDG_DATA_HOME = false
+end
+
+t.section("a binary that is not there is reported, not launched")
+do
+  local M = fresh()
+  M.options.binary = "/nowhere/Ladybird"
+  -- A launch is the only path that builds a command line, so it is the one that
+  -- has to refuse.
+  local err = t.error_of(M.launch, { block_id = "block:1" }, "https://example.com/")
+  t.check("the error names the option to set", err ~= nil and err:find("LADYBIRD_BINARY", 1, true) ~= nil, err)
+  t.check("and no pane was split", #fake:calls_of("split") == 0, "split calls")
+end
+
+t.section("the clipboard is whichever tool this machine has")
+do
+  local M = fresh()
+  M.url = function() return { url = "https://example.com/", title = "Example", source = "devtools" } end
+
+  local err = t.error_of(M.copy_url, { block_id = "block:1" })
+  t.check("with no clipboard tool the error lists the options",
+    err ~= nil and err:find("wl-copy", 1, true) ~= nil and err:find("xclip", 1, true) ~= nil, err)
+
+  fake:on_exec("/bin/sh -c command -v wl-copy", { ok = true, stdout = "/usr/bin/wl-copy\n" })
+  local copied = {}
+  fake:on_exec("/bin/sh -c /usr/bin/wl-copy", function(argv)
+    copied[#copied + 1] = argv[3]
+    return { ok = true, stdout = "" }
+  end)
+  local result = M.copy_url({ block_id = "block:1" })
+  t.check("the address comes back", result.url == "https://example.com/", result.url)
+  t.check("and went to wl-copy rather than pbcopy",
+    #copied == 1 and copied[1]:find("wl%-copy") ~= nil and copied[1]:find("pbcopy") == nil, copied[1])
+end
+
 t.done()

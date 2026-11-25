@@ -15,6 +15,7 @@ import os
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import unittest
 from pathlib import Path
@@ -117,11 +118,13 @@ class FakeDevTools:
 
 
 class LadyctlTests(unittest.TestCase):
-    def run_cli(self, *arguments: str, port: int) -> subprocess.CompletedProcess:
-        environment = dict(os.environ)
+    def run_cli(self, *arguments: str, port: int | None, environment: dict | None = None) -> subprocess.CompletedProcess:
+        environment = dict(os.environ if environment is None else environment)
         environment.pop("LADYCTL_PORT", None)
         return subprocess.run(
-            [sys.executable, str(LADYCTL), "--port", str(port), *arguments],
+            [sys.executable, str(LADYCTL)]
+            + ([] if port is None else ["--port", str(port)])
+            + list(arguments),
             capture_output=True, text=True, timeout=60, env=environment,
         )
 
@@ -171,6 +174,22 @@ class LadyctlTests(unittest.TestCase):
             fake.close()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), "Example Domain")
+
+    def test_the_state_directory_follows_xdg(self) -> None:
+        # The module honours XDG_STATE_HOME, so the CLI has to read the port from
+        # the same place or the two halves of the setup stop finding each other.
+        fake = FakeDevTools(answers="Example Domain")
+        try:
+            with tempfile.TemporaryDirectory() as home:
+                state = Path(home, "xdg", "rex-ladybird")
+                state.mkdir(parents=True)
+                (state / "port").write_text(f"{fake.port}\n")
+                environment = dict(os.environ, HOME=home, XDG_STATE_HOME=str(state.parent))
+                result = self.run_cli("url", port=None, environment=environment)
+        finally:
+            fake.close()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "https://example.com/")
 
     def test_a_dead_port_is_not_success(self) -> None:
         # Bind and release, so the port is very likely to be closed.

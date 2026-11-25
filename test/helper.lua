@@ -37,6 +37,9 @@ function helper.load_module(fake, opts)
     profile = fake.tmp .. "/profile",
   }
   for name, value in pairs(opts or {}) do merged[name] = value end
+  -- The module checks that the binary is executable before it opens a pane, so
+  -- the stand-in path has to pass that probe too.
+  fake:on_exec("/bin/test -x " .. merged.binary, { ok = true, stdout = "" })
   local M = dofile(helper.root .. "/init.lua")
   return M.setup(merged), M
 end

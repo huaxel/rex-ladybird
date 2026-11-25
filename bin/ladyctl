@@ -24,7 +24,11 @@ import sys
 import time
 
 HOME = os.path.expanduser("~")
-STATE_DIR = os.path.join(HOME, ".local", "state", "rex-ladybird")
+# The same directory the Rex module writes: ${XDG_STATE_HOME:-~/.local/state}.
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.join(HOME, ".local", "state"),
+    "rex-ladybird",
+)
 BLOCK_FILE = os.path.join(STATE_DIR, "current")
 PORT_FILE = os.path.join(STATE_DIR, "port")
 

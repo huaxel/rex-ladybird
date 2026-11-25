@@ -21,16 +21,49 @@ local function executable(path)
   return probe ~= nil and probe.ok
 end
 
+-- The absolute path `command -v` prints for a program on PATH, or nil.
+local function on_path(name)
+  local probe = rex.exec({ "/bin/sh", "-c", "command -v " .. name })
+  if probe == nil or not probe.ok then return nil end
+  local path = (probe.stdout or ""):gsub("%s+$", "")
+  if path == "" then return nil end
+  return path
+end
+
+-- The first path in the list that can be opened for reading. Used for files a
+-- browser owns, so a missing candidate is ordinary rather than an error.
+local function first_existing(paths)
+  for _, path in ipairs(paths) do
+    local file = io.open(path, "r")
+    if file then
+      file:close()
+      return path
+    end
+  end
+end
+
 local M = {
   options = {
     -- The build with the status-line patch; falls back to the installed app when
     -- this path is missing (see README, "Hiding terminal mode's own status line").
+    -- An explicit LADYBIRD_BINARY wins, then a development build in the usual
+    -- places, then the installed app, then whatever PATH offers. A terminal-mode
+    -- build is required: a release .dmg will not do.
     binary = (function()
-      local built = HOME .. "/projects/ladybird/Build/release/bin/Ladybird.app/Contents/MacOS/Ladybird"
-      if executable(built) then return built end
-      return "/Applications/Ladybird.app/Contents/MacOS/Ladybird"
+      local override = os.getenv("LADYBIRD_BINARY")
+      if override ~= nil and override ~= "" then return override end
+      for _, built in ipairs{
+        HOME .. "/projects/ladybird/Build/release/bin/Ladybird.app/Contents/MacOS/Ladybird",
+        HOME .. "/ladybird/Build/release/bin/Ladybird.app/Contents/MacOS/Ladybird",
+        HOME .. "/src/ladybird/Build/release/bin/Ladybird.app/Contents/MacOS/Ladybird",
+        "/Applications/Ladybird.app/Contents/MacOS/Ladybird",
+      } do
+        if executable(built) then return built end
+      end
+      return on_path("ladybird") or "/Applications/Ladybird.app/Contents/MacOS/Ladybird"
     end)(),
-    profile = HOME .. "/.local/share/ladybird-terminal-profile",
+    profile = (os.getenv("XDG_DATA_HOME") or (HOME .. "/.local/share"))
+      .. "/ladybird-terminal-profile",
     device_pixel_ratio = 2,
     label = "Ladybird",
     devtools_port = 9317,
@@ -42,7 +75,17 @@ local M = {
       if executable(beside) then return beside end
       return HOME .. "/.local/bin/ladyctl"
     end)(),
-    chrome_history = HOME .. "/Library/Application Support/Google/Chrome/Default/History",
+    -- Whichever of the common Chrome-family histories this machine has. The
+    -- picker treats a missing file as an empty history, so the first candidate
+    -- is a harmless default.
+    chrome_history = first_existing{
+      HOME .. "/Library/Application Support/Google/Chrome/Default/History",
+      HOME .. "/Library/Application Support/Chromium/Default/History",
+      HOME .. "/.config/google-chrome/Default/History",
+      HOME .. "/.config/chromium/Default/History",
+      HOME .. "/.config/BraveSoftware/Brave-Browser/Default/History",
+      HOME .. "/.config/microsoft-edge/Default/History",
+    } or (HOME .. "/Library/Application Support/Google/Chrome/Default/History"),
     history_items = 400,
   },
 }
@@ -459,6 +502,12 @@ function maybe_hide_status_line(block_id)
 end
 
 function ladybird_command(url, port)
+  -- Fail here rather than in a pane that dies on its first frame: a missing
+  -- terminal-mode build is the most likely first-run problem.
+  if not executable(M.options.binary) then
+    raise("no usable Ladybird binary at " .. tostring(M.options.binary)
+      .. "; set LADYBIRD_BINARY or the binary option to a --headless=terminal build")
+  end
   return {
     M.options.binary,
     "--headless=terminal",
@@ -552,13 +601,31 @@ function M.links(ctx)
   return { opened = true, block_id = block_id, url = href }
 end
 
+-- The command that copies standard input to the clipboard on this machine, or
+-- nil when none of them is installed.
+local function clipboard_reads_stdin()
+  local path = on_path("pbcopy")
+  if path then return path end
+  path = on_path("wl-copy")
+  if path then return path end
+  path = on_path("xclip")
+  if path then return path .. " -selection clipboard" end
+  path = on_path("xsel")
+  if path then return path .. " --clipboard --input" end
+end
+
 function M.copy_url(ctx)
   local result = M.url(ctx)
   local path = os.tmpname()
   local file = assert(io.open(path, "w"))
   file:write(result.url)
   file:close()
-  local copied = rex.exec({ "/bin/sh", "-c", "pbcopy < '" .. path .. "'" })
+  local clipboard = clipboard_reads_stdin()
+  if clipboard == nil then
+    os.remove(path)
+    raise("no clipboard tool: install pbcopy (macOS), wl-copy (Wayland) or xclip/xsel (X11)")
+  end
+  local copied = rex.exec({ "/bin/sh", "-c", clipboard .. " < '" .. path .. "'" })
   os.remove(path)
   if copied == nil or not copied.ok then raise("could not copy the address") end
   return result

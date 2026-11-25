@@ -6,10 +6,20 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Lua, Python and shellcheck
-        run: sudo apt-get update && sudo apt-get install -y luajit python3 shellcheck
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install luajit shellcheck
+          else
+            sudo apt-get update
+            sudo apt-get install -y luajit shellcheck
+          fi
       - name: Run the checks
         run: bash test/run.sh
