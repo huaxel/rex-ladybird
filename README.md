@@ -3,6 +3,9 @@
 Rex integration for Ladybird's terminal mode (`--headless=terminal`). Rex owns the
 pickers and the layout; Ladybird owns the page.
 
+The usage guide for people and agents lives in the shared skill catalog:
+`~/dotfiles/skills/rex-ladybird/SKILL.md`, with the full command reference beside it.
+
 ## Why
 
 Ladybird's terminal mode already renders a real page in a Rex pane and exposes a
