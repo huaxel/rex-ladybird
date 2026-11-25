@@ -39,12 +39,13 @@ rex.bind("ctrl+b>w", "ladybird_open")
 rex.bind("ctrl+b>l", "ladybird_new")
 rex.bind("ctrl+b>u", "ladybird_url")
 rex.bind("ctrl+b>k", "ladybird_links")
+rex.bind("ctrl+b>c", "ladybird_click")
 rex.bind("ctrl+b>n", "ladybird_tab_new")
 rex.bind("ctrl+b>b", "ladybird_tabs")
 rex.bind("ctrl+b>x", "ladybird_tab_close")
 ```
 
-Then `rex config reload`. `rex keymap` should list the seven bindings; if they are
+Then `rex config reload`. `rex keymap` should list the eight bindings; if they are
 missing, the module was not found on Rex's `package.path` — the symlink above is what
 puts it there.
 
@@ -71,6 +72,7 @@ in-terminal prompt, and no keystrokes are faked.
 | `ctrl+b>w` | `ladybird_open` | Pick from Chrome + Ladybird history, or type an address/search, and load it |
 | `ctrl+b>l` | `ladybird_new` | Open a Ladybird pane beside the focused one at the picked address |
 | `ctrl+b>k` | `ladybird_links` | Pick a link from the page's current DOM and load it |
+| `ctrl+b>c` | `ladybird_click` | Pick any control the page offers — a button, a field, a menu item — and click it |
 | `ctrl+b>n` | `ladybird_tab_new` | Open a new tab (block) beside the active one at the picked address |
 | `ctrl+b>b` | `ladybird_tabs` | Pick an open tab and bring it to the front |
 | `ctrl+b>x` | `ladybird_tab_close` | Close the picked tab |
@@ -140,20 +142,39 @@ agents and other tools use the same two surfaces:
 ladyctl tabs            # every tab, with its real title and URL
 ladyctl url | title     # current page
 ladyctl links --limit 50
+ladyctl snapshot        # number the controls (e1, e2, …) and read the page text
 ladyctl eval 'document.querySelectorAll("a").length'
-ladyctl click 'a[href="/pulls"]'
+ladyctl click e2        # a ref from the last snapshot, or any CSS selector
+ladyctl type e1 'ladybird browser' --clear --submit
+ladyctl press tab enter
+echo 'document.title' | ladyctl eval -
+ladyctl wait --text Saved --timeout 10
 ladyctl open https://example.com     # via DevTools, or the APC channel as a fallback
 ladyctl back | forward | reload | quit
 ```
 
 It reads the port and the pane from the same state directory as this module.
 
+`snapshot` is what makes the page drivable rather than readable: it marks every
+control it lists with `data-lb-ref`, so `click e3` is that control even after the
+page has moved around, and it fails by name when the page no longer has it. The
+text is capped at 20000 characters (`--max 0` for all of it), `--json` returns
+the whole page as one object, and `--list` prints one control per line —
+`ref<TAB>kind<TAB>label[<TAB>flags]` — for the Rex picker behind `ctrl+b>c`.
+
+`type` writes real keystrokes into the pane with `rex send`, after focusing the
+field through the page, so autocomplete, validation and framework models see the
+same events a person's typing produces.
+
 Exit status is meant for scripts: an unreachable DevTools server exits 1 with
 `cannot reach the devtools server on PORT`, `click` exits 1 with
-`no element matches SELECTOR` instead of reporting a silent no-op, and `eval`
+`no element matches SELECTOR` instead of reporting a silent no-op, `click e3`
+exits 1 with `no element e3` when the snapshot is older than the page, and `eval`
 exits 1 with `no evaluation result` when the script throws — Ladybird sends no
 `evaluationResult` in that case, so an exception and a dead console look alike
-from the client.
+from the client. `type` refuses to type when the field did not take focus rather
+than sending the text to whatever has it, and `wait` names what it waited for and
+how long: `waited 10s for the page to mention "Saved"`.
 
 ## The two surfaces, and what each is good for
 

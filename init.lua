@@ -601,6 +601,46 @@ function M.links(ctx)
   return { opened = true, block_id = block_id, url = href }
 end
 
+-- The controls the page offers, as a picker; the choice is clicked through
+-- ladyctl, so the click carries the pointer events a menu or a drag target
+-- listens for. A ref that the page has moved out from under us is a failure,
+-- not a click on whatever took its place.
+function M.click_control(ctx)
+  local block_id = target_block(ctx)
+  if not block_id then raise("no Ladybird pane is open") end
+  local stdout, err = run({ M.options.ladyctl, "snapshot", "--list" })
+  if not stdout then raise("ladyctl could not read the page: " .. tostring(err)) end
+  local items = {}
+  for line in stdout:gmatch("[^\n]+") do
+    local ref, kind, rest = line:match("^(e%d+)\t([^\t]+)\t(.*)$")
+    if ref then
+      -- Tab-separated: a label can hold a comma or an em dash, but not a tab.
+      local label, flags = rest:match("^(.-)\t(.*)$")
+      if label == nil then label, flags = rest, nil end
+      items[#items + 1] = {
+        id = ref,
+        title = label ~= "" and label or "(" .. kind .. ")",
+        subtitle = kind .. (flags and (" [" .. flags .. "]") or ""),
+        icon = "globe",
+      }
+    end
+  end
+  if #items == 0 then return { clicked = false, reason = "no_controls" } end
+  local choice, why = rex.ui.pick{
+    title = "Ladybird: click a control on this page",
+    placeholder = "Filter controls",
+    items = items,
+  }
+  if choice == nil then
+    if why ~= "cancelled" then raise("control picker: " .. tostring(why)) end
+    return { clicked = false, reason = "cancelled" }
+  end
+  local ref = type(choice) == "table" and choice.id or choice
+  local clicked, click_err = run({ M.options.ladyctl, "click", ref })
+  if not clicked then raise("could not click " .. tostring(ref) .. ": " .. tostring(click_err)) end
+  return { clicked = true, block_id = block_id, ref = ref }
+end
+
 -- The command that copies standard input to the clipboard on this machine, or
 -- nil when none of them is installed.
 local function clipboard_reads_stdin()
@@ -662,6 +702,10 @@ function M.setup(opts)
   register("ladybird_links", "Ladybird: open a link on this page…",
     "Pick a link from the page as the DevTools server reports it, and load it in the pane.",
     "Browser", function(ctx) return M.links(ctx) end)
+
+  register("ladybird_click", "Ladybird: click a control on this page…",
+    "Pick a control the page offers -- a link, a button, a field -- and click it.",
+    "Browser", function(ctx) return M.click_control(ctx) end)
 
   register("ladybird_tab_new", "Ladybird: new tab…",
     "Open the picked address in a new tab: a full-window floating layer in this window.",

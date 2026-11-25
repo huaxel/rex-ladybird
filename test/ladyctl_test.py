@@ -191,6 +191,137 @@ class LadyctlTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "https://example.com/")
 
+    def pane_environment(self, directory: Path) -> tuple[dict, Path, Path]:
+        """An environment where the CLI finds a pane, and a `rex` that only records.
+
+        Returns the environment, the log the fake `rex` writes, and its directory.
+        """
+        state = Path(directory, "state", "rex-ladybird")
+        state.mkdir(parents=True)
+        (state / "current").write_text("block:1\n")
+        binaries = Path(directory, "bin")
+        binaries.mkdir()
+        rex = binaries / "rex"
+        rex.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$REX_LOG"\n')
+        rex.chmod(0o755)
+        log = Path(directory, "rex.log")
+        environment = dict(
+            os.environ,
+            HOME=str(directory),
+            XDG_STATE_HOME=str(Path(directory, "state")),
+            PATH=str(binaries) + os.pathsep + os.environ.get("PATH", ""),
+            REX_LOG=str(log),
+        )
+        return environment, log, binaries
+
+    @staticmethod
+    def page(*elements: dict, text: str = "Hello") -> str:
+        return json.dumps({"title": "Example", "url": "https://example.com/", "elements": list(elements), "text": text})
+
+    def test_snapshot_numbers_the_controls(self) -> None:
+        answer = self.page(
+            {"ref": "e1", "kind": "text", "label": "Search", "value": "ladybird", "flags": []},
+            {"ref": "e2", "kind": "button", "label": "Go", "value": None, "flags": ["disabled"]},
+        )
+        fake = FakeDevTools(answers=answer)
+        try:
+            result = self.run_cli("snapshot", port=fake.port)
+        finally:
+            fake.close()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('[e1] text "Search" = "ladybird"', result.stdout)
+        self.assertIn('[e2] button "Go" [disabled]', result.stdout)
+        self.assertIn("Hello", result.stdout)
+        # The refs have to come from somewhere the next command can find them.
+        self.assertIn("data-lb-ref", fake.scripts[0])
+
+    def test_snapshot_list_is_one_control_per_line(self) -> None:
+        # The Rex picker reads this without a JSON parser, so the shape is pinned:
+        # ref, kind, label, then the flags when there are any.
+        answer = self.page(
+            {"ref": "e1", "kind": "link", "label": "Docs", "value": None, "flags": []},
+            {"ref": "e2", "kind": "checkbox", "label": "Remember me", "value": None, "flags": ["checked"]},
+        )
+        fake = FakeDevTools(answers=answer)
+        try:
+            result = self.run_cli("snapshot", "--list", port=fake.port)
+        finally:
+            fake.close()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["e1\tlink\tDocs", "e2\tcheckbox\tRemember me\tchecked"])
+
+    def test_click_follows_a_snapshot_ref(self) -> None:
+        fake = FakeDevTools(answers="clicked")
+        try:
+            result = self.run_cli("click", "e2", port=fake.port)
+        finally:
+            fake.close()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("data-lb-ref", fake.scripts[0])
+        self.assertIn("pointerdown", fake.scripts[0])
+        self.assertIn("scrollIntoView", fake.scripts[0])
+
+    def test_a_ref_the_page_no_longer_has_fails_by_name(self) -> None:
+        fake = FakeDevTools(answers="missing")
+        try:
+            result = self.run_cli("click", "e9", port=fake.port)
+        finally:
+            fake.close()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no element e9", result.stderr)
+
+    def test_type_sends_real_keystrokes(self) -> None:
+        fake = FakeDevTools(answers="focused")
+        with tempfile.TemporaryDirectory() as home:
+            environment, log, _ = self.pane_environment(Path(home))
+            try:
+                result = self.run_cli("type", "e1", "hello", "--submit", port=fake.port, environment=environment)
+            finally:
+                fake.close()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = log.read_text().splitlines()
+        # The text and the Enter are keystrokes in the pane, not synthetic events.
+        self.assertIn("send -b block:1 -- hello", calls)
+        self.assertIn("send-key -b block:1 enter", calls)
+
+    def test_type_does_not_type_when_the_field_does_not_focus(self) -> None:
+        fake = FakeDevTools(answers="missing")
+        with tempfile.TemporaryDirectory() as home:
+            environment, log, _ = self.pane_environment(Path(home))
+            try:
+                result = self.run_cli("type", "e1", "hello", port=fake.port, environment=environment)
+            finally:
+                fake.close()
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("no element e1", result.stderr)
+            # Typing into whatever has focus would be worse than failing.
+            self.assertFalse(log.exists(), "the CLI sent keystrokes to whatever had focus")
+
+    def test_press_sends_the_keys_to_the_pane(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            environment, log, _ = self.pane_environment(Path(home))
+            result = self.run_cli("press", "tab", "enter", port=None, environment=environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("send-key -b block:1 tab enter", log.read_text().splitlines())
+
+    def test_wait_returns_when_the_condition_holds(self) -> None:
+        fake = FakeDevTools(answers=True)
+        try:
+            result = self.run_cli("wait", "--selector", "#done", "--timeout", "5", port=fake.port)
+        finally:
+            fake.close()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("#done", fake.scripts[0])
+
+    def test_wait_says_what_it_waited_for(self) -> None:
+        fake = FakeDevTools(answers=False)
+        try:
+            result = self.run_cli("wait", "--selector", "#spinner", "--timeout", "0.4", port=fake.port)
+        finally:
+            fake.close()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("waited 0.4s for the page to show #spinner", result.stderr)
+
     def test_a_dead_port_is_not_success(self) -> None:
         # Bind and release, so the port is very likely to be closed.
         probe = socket.socket()

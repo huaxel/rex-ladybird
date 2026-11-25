@@ -286,13 +286,55 @@ end
 
 --- Registration ----------------------------------------------------------
 
+t.section("the controls on the page are picked from a snapshot")
+do
+  local M = fresh()
+  fake:on_exec("/tmp/ladyctl snapshot --list", { ok = true, stdout =
+    "e1\tlink\tDocs\n" ..
+    "e2\tbutton\t\n" ..
+    "e3\tcheckbox\tRemember me\tchecked\n" })
+  fake:on_exec("/tmp/ladyctl click", { ok = true, stdout = "clicked\n" })
+  fake.pick_answers = { { value = { id = "e3" } } }
+
+  local result = M.click_control({ block_id = "block:1" })
+  local pick = fake:last_call("pick")
+  t.check("every control is offered", #pick.spec.items == 3, #pick.spec.items)
+  t.check("a labelled control shows its label", pick.spec.items[1].title == "Docs", pick.spec.items[1].title)
+  t.check("an unlabelled one shows its kind", pick.spec.items[2].title == "(button)", pick.spec.items[2].title)
+  t.check("flags are shown beside the kind", pick.spec.items[3].subtitle == "checkbox [checked]",
+    pick.spec.items[3].subtitle)
+  t.check("the pick is clicked by ref", result.clicked == true and result.ref == "e3", result.ref)
+  local click = fake:last_call("exec")
+  t.check("through ladyctl, so the click is a real one",
+    table.concat(click.argv, " ") == "/tmp/ladyctl click e3", table.concat(click.argv, " "))
+
+  -- Cancelling is not an error, and nothing is clicked.
+  fake.pick_answers = { { reason = "cancelled" } }
+  local none = M.click_control({ block_id = "block:1" })
+  t.check("cancelling changes nothing", none.clicked == false and none.reason == "cancelled", none.reason)
+
+  -- A page with no controls is reported, not raised: tabs and error pages are real.
+  fake:on_exec("/tmp/ladyctl snapshot --list", { ok = true, stdout = "" })
+  local empty = M.click_control({ block_id = "block:1" })
+  t.check("a page with no controls says so", empty.clicked == false and empty.reason == "no_controls",
+    tostring(empty.reason))
+
+  -- A click that fails is a failure: the page did not do what was asked.
+  fake:on_exec("/tmp/ladyctl snapshot --list", { ok = true, stdout = "e1\tlink\tDocs\n" })
+  fake.pick_answers = { { value = "e1" } }
+  fake:on_exec("/tmp/ladyctl click", { ok = false, stderr = "no element e1" })
+  local err = t.error_of(M.click_control, { block_id = "block:1" })
+  t.check("a failed click is raised with ladyctl's reason",
+    err ~= nil and err:find("no element e1", 1, true) ~= nil, tostring(err))
+end
+
 t.section("every action is registered and callable")
 do
   local M = fresh()
   local names = {}
   for name in pairs(fake.actions) do names[#names + 1] = name end
   table.sort(names)
-  t.check("seven actions", #names == 7, table.concat(names, ", "))
+  t.check("eight actions", #names == 8, table.concat(names, ", "))
 
   -- Regression: the tab action reaches its helpers. A local defined after the
   -- action that calls it is nil, and only a real call shows that.

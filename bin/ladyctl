@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -49,13 +50,27 @@ def rex(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["rex", *args], capture_output=True, text=True, check=check)
 
 
-def terminal_write(payload: str) -> None:
+def pane_block() -> str:
+    """The Rex block this CLI drives: the pane the module recorded."""
     block = block_id()
     if not block:
         sys.exit("no Ladybird pane recorded; open one with the Rex action ladybird_new")
+    return block
+
+
+def terminal_write(payload: str) -> None:
+    block = pane_block()
     result = rex("send", "-b", block, payload, check=False)
     if result.returncode != 0:
         sys.exit(f"could not write to {block}: {result.stderr.strip()}")
+
+
+def send_keys(block: str, keys: list[str]) -> None:
+    """Press keys in the pane. These are the keystrokes a person would make, not
+    synthetic events, so a control that listens to the keyboard sees them."""
+    result = rex("send-key", "-b", block, *keys, check=False)
+    if result.returncode != 0:
+        sys.exit(f"could not send {', '.join(keys)} to {block}: {result.stderr.strip()}")
 
 
 def apc(command: str, argument: str = "") -> None:
@@ -197,13 +212,14 @@ def devtools_port(explicit: int | None) -> int | None:
         return None
 
 
+def no_port_message() -> str:
+    return f"no devtools port known: start Ladybird with --devtools=PORT or write the port to {PORT_FILE}"
+
+
 def connect(explicit_port: int | None) -> RDP:
     port = devtools_port(explicit_port)
     if port is None:
-        sys.exit(
-            "no devtools port known: start Ladybird with --devtools=PORT "
-            f"or write the port to {PORT_FILE}"
-        )
+        sys.exit(no_port_message())
     try:
         return RDP(port)
     except OSError as error:
@@ -299,6 +315,113 @@ LINKS_SCRIPT = """JSON.stringify([...document.links]
   .filter(a => a.href.startsWith('http'))
   .slice(0, %d))"""
 
+# A ref such as e3 names a control the last snapshot numbered, not "the third
+# control now": pages reorder themselves, and a page that changed under a
+# caller should fail rather than click whatever moved into that place.
+REF = re.compile(r"e[0-9]+")
+
+# Resolves the target of a click or a focus into `el` and brings it into view.
+# Selectors are matched with querySelector, refs through the marks a snapshot
+# left behind.
+FIND_SCRIPT = """const target = %s;
+const el = /^e[0-9]+$/.test(target)
+  ? document.querySelector('[data-lb-ref="' + target + '"]')
+  : document.querySelector(target);
+if (!el) return 'missing';
+el.scrollIntoView({block: 'center', inline: 'center'});
+"""
+
+CLICK_SCRIPT = "(() => {" + FIND_SCRIPT + """
+const box = el.getBoundingClientRect();
+const at = {bubbles: true, cancelable: true, composed: true, view: window, button: 0,
+            clientX: box.left + box.width / 2, clientY: box.top + box.height / 2};
+// A click is a sequence. Menus and drag targets listen for the pointer events
+// that come before the click, and a bare click() never produces them.
+const Pointer = window.PointerEvent || MouseEvent;
+el.dispatchEvent(new Pointer('pointerdown', at));
+el.dispatchEvent(new MouseEvent('mousedown', at));
+if (el.focus) el.focus();
+el.dispatchEvent(new Pointer('pointerup', at));
+el.dispatchEvent(new MouseEvent('mouseup', at));
+el.click();
+return 'clicked';
+})()"""
+
+FOCUS_SCRIPT = "(() => {" + FIND_SCRIPT + """
+el.focus();
+if (%s) {
+  if ('value' in el) {
+    // The setter on the prototype is the one a framework has wrapped; assigning
+    // to el.value directly can leave its model out of step with the field.
+    const setter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'value');
+    if (setter && setter.set) setter.set.call(el, ''); else el.value = '';
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+  } else if (el.isContentEditable) {
+    el.textContent = '';
+  }
+}
+return (document.activeElement === el || el.contains(document.activeElement)) ? 'focused' : 'unfocused';
+})()"""
+
+# Every control a person could operate, numbered in document order. A control
+# that is not drawn cannot be clicked, so it is left out rather than offered.
+SNAPSHOT_SCRIPT = """(() => {
+  for (const el of document.querySelectorAll('[data-lb-ref]')) el.removeAttribute('data-lb-ref');
+  const selector = ['a[href]', 'button', 'input:not([type=hidden])', 'select', 'textarea', 'summary',
+    '[contenteditable=""]', '[contenteditable=true]', '[role=button]', '[role=link]', '[role=checkbox]',
+    '[role=radio]', '[role=tab]', '[role=menuitem]', '[role=option]', '[role=switch]', '[role=textbox]',
+    '[role=combobox]', '[role=searchbox]', '[tabindex]:not([tabindex="-1"])'].join(',');
+  const kind = el => {
+    const role = el.getAttribute('role');
+    if (role) return role;
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'input') {
+      const type = (el.getAttribute('type') || 'text').toLowerCase();
+      if (type === 'checkbox' || type === 'radio') return type;
+      if (['submit', 'button', 'reset', 'image'].includes(type)) return 'button';
+      return type === 'text' ? 'text' : type;
+    }
+    if (tag === 'a') return 'link';
+    if (tag === 'textarea' || el.isContentEditable) return 'text';
+    return tag;
+  };
+  const clean = value => (value || '').replace(/\\s+/g, ' ').trim().slice(0, 80);
+  const byId = id => { const el = document.getElementById(id); return el ? el.textContent : ''; };
+  const label = el => {
+    const named = el.getAttribute('aria-labelledby');
+    return clean(el.getAttribute('aria-label'))
+      || clean(named && named.split(/\\s+/).map(byId).join(' '))
+      || clean(el.labels && [...el.labels].map(l => l.textContent).join(' '))
+      || clean(el.getAttribute('placeholder'))
+      || clean(el.innerText)
+      || clean(el.getAttribute('title'))
+      || clean(el.getAttribute('alt'))
+      || clean(['submit', 'button', 'reset'].includes(el.type) ? el.value : '')
+      || clean(el.getAttribute('name'));
+  };
+  const elements = [];
+  for (const el of document.querySelectorAll(selector)) {
+    if (!el.getClientRects().length) continue;
+    const style = getComputedStyle(el);
+    if (style.visibility === 'hidden' || style.display === 'none') continue;
+    const ref = 'e' + (elements.length + 1);
+    el.setAttribute('data-lb-ref', ref);
+    const flags = [];
+    if (el.checked || el.getAttribute('aria-checked') === 'true') flags.push('checked');
+    if (el.disabled || el.getAttribute('aria-disabled') === 'true') flags.push('disabled');
+    if (el === document.activeElement) flags.push('focused');
+    const filled = 'value' in el && !['checkbox', 'radio', 'submit', 'button'].includes(el.type) && el.value;
+    elements.push({ref: ref, kind: kind(el), label: label(el),
+                   value: filled ? String(el.value).slice(0, 80) : null, flags: flags});
+  }
+  return JSON.stringify({
+    title: document.title,
+    url: location.href,
+    elements: elements,
+    text: (document.body ? document.body.innerText : '').replace(/\\n{3,}/g, '\\n\\n').trim(),
+  });
+})()"""
+
 
 def command_links(args) -> None:
     connection = connect(args.port)
@@ -314,13 +437,111 @@ def command_links(args) -> None:
 
 def command_click(args) -> None:
     connection = connect(args.port)
-    script = f"(() => {{ const el = document.querySelector({json.dumps(args.selector)}); if (!el) return 'missing'; el.click(); return 'clicked'; }})()"
-    outcome = connection.evaluate(script)
-    # A selector that matches nothing is a failed click, not a successful no-op:
+    outcome = connection.evaluate(CLICK_SCRIPT % json.dumps(args.target))
+    # A target that matches nothing is a failed click, not a successful no-op:
     # a caller that goes on to read the page would be reading the wrong page.
     if outcome != "clicked":
-        sys.exit(f"no element matches {args.selector}")
+        sys.exit(missing_target(args.target))
     emit(args, outcome)
+
+
+def command_snapshot(args) -> None:
+    connection = connect(args.port)
+    raw = connection.evaluate(SNAPSHOT_SCRIPT) or "{}"
+    page = json.loads(raw)
+    elements = page.get("elements") or []
+    text = page.get("text") or ""
+    if args.max and len(text) > args.max:
+        text = text[: args.max] + f"\n…({len(page.get('text') or '') - args.max} more characters; use --max 0 for all)"
+        page["text"] = text
+    if args.list:
+        # One control per line and nothing else, so a picker can read this
+        # without a JSON parser: ref, kind, label, then flags when there are any.
+        for element in elements:
+            line = "\t".join([element["ref"], element["kind"], element["label"]])
+            if element["flags"]:
+                line += "\t" + ",".join(element["flags"])
+            print(line)
+        return
+    if args.json:
+        emit(args, page)
+        return
+    print(f"{page.get('title') or '(untitled)'}\n{page.get('url') or ''}")
+    print("\nElements:")
+    if not elements:
+        print("(none)")
+    for element in elements:
+        value = f" = {json.dumps(element['value'])}" if element.get("value") else ""
+        flags = "".join(f" [{flag}]" for flag in element["flags"])
+        print(f"[{element['ref']}] {element['kind']} {json.dumps(element['label'], ensure_ascii=False)}{value}{flags}")
+    print(f"\nText:\n{text or '(none)'}")
+
+
+def command_type(args) -> None:
+    block = pane_block()
+    connection = connect(args.port)
+    outcome = connection.evaluate(FOCUS_SCRIPT % (json.dumps(args.target), "true" if args.clear else "false"))
+    connection.close()
+    if outcome == "missing":
+        sys.exit(missing_target(args.target))
+    if outcome != "focused":
+        sys.exit(f"{args.target} did not take focus, so the text would go to the page")
+    # The text goes in as keystrokes: a field that reacts to input events
+    # (autocomplete, validation, a framework's own model) only sees those.
+    if args.text:
+        # `--` stops rex reading a leading '-' as a flag.
+        typed = rex("send", "-b", block, "--", args.text, check=False)
+        if typed.returncode != 0:
+            sys.exit(f"could not type into {block}: {typed.stderr.strip()}")
+    if args.submit:
+        send_keys(block, ["enter"])
+    emit(args, {"typed": args.text or "", "submitted": bool(args.submit)})
+
+
+def command_press(args) -> None:
+    block = pane_block()
+    send_keys(block, args.keys)
+    emit(args, {"pressed": args.keys})
+
+
+def command_wait(args) -> None:
+    port = devtools_port(args.port)
+    if port is None:
+        sys.exit(no_port_message())
+    conditions = ["document.readyState === 'complete'"]
+    wanted = "the page"
+    if args.selector:
+        conditions.append(f"!!document.querySelector({json.dumps(args.selector)})")
+        wanted += f" to show {args.selector}"
+    if args.text:
+        conditions.append(f"(document.body ? document.body.innerText : '').includes({json.dumps(args.text)})")
+        wanted += f" to mention {json.dumps(args.text)}"
+    script = "(" + " && ".join(conditions) + ")"
+    deadline = time.monotonic() + args.timeout
+    while True:
+        connection = None
+        try:
+            connection = RDP(port, timeout=5)
+            if connection.evaluate(script) is True:
+                emit(args, {"waited": True, "selector": args.selector, "text": args.text})
+                return
+        except (OSError, ConnectionError, RuntimeError, TimeoutError):
+            # The page is between documents: the console actor it was reached
+            # through is gone, and the next attempt attaches to the new one.
+            pass
+        finally:
+            if connection:
+                connection.close()
+        if time.monotonic() > deadline:
+            sys.exit(f"waited {args.timeout}s for {wanted}")
+        time.sleep(0.2)
+
+
+def missing_target(target: str) -> str:
+    """Why a click or a focus found nothing, in the caller's own terms."""
+    if REF.fullmatch(target):
+        return f"no element {target}; the snapshot may be older than the page, so take another"
+    return f"no element matches {target}"
 
 
 def command_chrome(args) -> None:
@@ -369,7 +590,24 @@ def main() -> int:
     add("links", "list the links on the page", command_links).add_argument(
         "--limit", type=int, default=200, help="how many links to report (default 200)"
     )
-    add("click", "click the first element matching a CSS selector", command_click).add_argument("selector")
+    snapshot = add("snapshot", "number the controls on the page (e1, e2, …) and read its text", command_snapshot)
+    snapshot.add_argument("--list", action="store_true", help="print one control per line: ref, kind, label, flags")
+    snapshot.add_argument("--max", type=int, default=20000, help="cap the page text at this many characters (0 for all)")
+    add("click", "click an element: a ref from snapshot such as e2, or a CSS selector", command_click).add_argument(
+        "target"
+    )
+    typing = add("type", "focus an element and type into it with real keystrokes", command_type)
+    typing.add_argument("target")
+    typing.add_argument("text", nargs="?", default="", help="text to type (default: none, just focus)")
+    typing.add_argument("--clear", action="store_true", help="empty the field first")
+    typing.add_argument("--submit", action="store_true", help="press enter afterwards")
+    add("press", "press keys in the pane, such as enter, tab, escape or ctrl+a", command_press).add_argument(
+        "keys", nargs="+"
+    )
+    waiting = add("wait", "wait for the page to load, and for --selector or --text if given", command_wait)
+    waiting.add_argument("--selector", help="wait until this CSS selector matches")
+    waiting.add_argument("--text", help="wait until the visible text contains this")
+    waiting.add_argument("--timeout", type=float, default=30, help="seconds to wait (default 30)")
     chrome = add("chrome", "hide or show terminal mode's own status line", command_chrome)
     chrome.add_argument("state", choices=["on", "off"])
     add("quit", "close the browser", command_quit)
