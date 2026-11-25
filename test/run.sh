@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs the Lua tests against a fake Rex, then shellcheck on the helpers in bin/.
+# Runs the Lua tests against a fake Rex, the CLI tests against a fake DevTools
+# server, then shellcheck on the helpers in bin/.
 # Exits non-zero if any of them fails.
 #
 #   bash test/run.sh
@@ -41,5 +42,8 @@ fi
 # The helpers are Python; check that they compile and that the CLI still answers.
 step "compile bin/" python3 -m py_compile bin/ladyctl bin/ladybird-import-chrome-cookies
 step "ladyctl --help" python3 bin/ladyctl --help
+# The CLI's exit codes are the interface a script or an agent reads, so they are
+# pinned against a fake DevTools server rather than left to a live browser.
+step "ladyctl contract" python3 test/ladyctl_test.py
 
 exit $failed

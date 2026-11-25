@@ -169,7 +169,9 @@ class RDP:
             and p.get("resultID") == ack["resultID"]
         )
         if result is None:
-            raise RuntimeError("the console actor did not answer the script")
+            # Ladybird sends no evaluationResult when the script throws, so an
+            # exception and a dead console look the same from here.
+            raise RuntimeError("no evaluation result: the script threw, or the console did not answer")
         if result.get("hasException"):
             raise RuntimeError(result.get("exceptionMessage") or "the script threw")
         return result.get("result")
@@ -309,7 +311,12 @@ def command_links(args) -> None:
 def command_click(args) -> None:
     connection = connect(args.port)
     script = f"(() => {{ const el = document.querySelector({json.dumps(args.selector)}); if (!el) return 'missing'; el.click(); return 'clicked'; }})()"
-    emit(args, connection.evaluate(script))
+    outcome = connection.evaluate(script)
+    # A selector that matches nothing is a failed click, not a successful no-op:
+    # a caller that goes on to read the page would be reading the wrong page.
+    if outcome != "clicked":
+        sys.exit(f"no element matches {args.selector}")
+    emit(args, outcome)
 
 
 def command_chrome(args) -> None:

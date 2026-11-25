@@ -102,6 +102,13 @@ ladyctl back | forward | reload | quit
 
 It reads the port and the pane from the same state directory as this module.
 
+Exit status is meant for scripts: an unreachable DevTools server exits 1 with
+`cannot reach the devtools server on PORT`, `click` exits 1 with
+`no element matches SELECTOR` instead of reporting a silent no-op, and `eval`
+exits 1 with `no evaluation result` when the script throws — Ladybird sends no
+`evaluationResult` in that case, so an exception and a dead console look alike
+from the client.
+
 ## The two surfaces, and what each is good for
 
 **APC command channel** — `ESC _ ladybird;<command>;<argument> ESC \` written into the
