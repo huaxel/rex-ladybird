@@ -35,9 +35,12 @@ class FakeDevTools:
     script and then never sends an evaluationResult.
     """
 
-    def __init__(self, answers="clicked", with_result=True):
+    def __init__(self, answers="clicked", with_result=True, hang_up=False):
         self.answers = answers
         self.with_result = with_result
+        # hang_up models a server that accepts and then says nothing useful, the
+        # way a browser still starting up does.
+        self.hang_up = hang_up
         self.scripts: list[str] = []
         self.server = socket.socket()
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -80,8 +83,15 @@ class FakeDevTools:
                 return
             with connection:
                 self.send(connection, {"from": "root", "applicationType": "browser", "traits": {}})
+                if self.hang_up:
+                    continue
                 while True:
-                    packet = self.read_packet(connection)
+                    try:
+                        packet = self.read_packet(connection)
+                    except OSError:
+                        # A client that hangs up mid-packet is normal: a liveness
+                        # probe connects and closes without saying anything.
+                        break
                     if packet is None:
                         break
                     self.answer(connection, packet)
@@ -118,7 +128,7 @@ class FakeDevTools:
 
 
 class LadyctlTests(unittest.TestCase):
-    def run_cli(self, *arguments: str, port: int | None, environment: dict | None = None) -> subprocess.CompletedProcess:
+    def run_cli(self, *arguments: str, port: int | None = None, environment: dict | None = None) -> subprocess.CompletedProcess:
         environment = dict(os.environ if environment is None else environment)
         environment.pop("LADYCTL_PORT", None)
         return subprocess.run(
@@ -321,6 +331,87 @@ class LadyctlTests(unittest.TestCase):
             fake.close()
         self.assertEqual(result.returncode, 1)
         self.assertIn("waited 0.4s for the page to show #spinner", result.stderr)
+
+    def test_ls_shows_the_recorded_panes(self) -> None:
+        fake = FakeDevTools(answers="Example Domain")
+        with tempfile.TemporaryDirectory() as home:
+            environment, _, _ = self.pane_environment(Path(home))
+            # One pane answers, one has quit: the listing says which is which
+            # instead of pretending both are usable.
+            (Path(home, "state", "rex-ladybird", "tabs")).write_text(
+                f"block:1\t{fake.port}\thttps://example.com/\nblock:2\t9\thttps://gone.example/\n"
+            )
+            try:
+                result = self.run_cli("--json", "ls", environment=environment)
+            finally:
+                fake.close()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rows = json.loads(result.stdout)
+        self.assertEqual([row["block"] for row in rows], ["block:1", "block:2"])
+        self.assertEqual([row["live"] for row in rows], [True, False])
+        self.assertEqual(rows[0]["title"], "Example")
+
+    def test_a_pane_that_listens_but_does_not_answer_is_still_listed(self) -> None:
+        fake = FakeDevTools(hang_up=True)
+        with tempfile.TemporaryDirectory() as home:
+            environment, _, _ = self.pane_environment(Path(home))
+            (Path(home, "state", "rex-ladybird", "tabs")).write_text(f"block:1\t{fake.port}\thttps://example.com/\n")
+            try:
+                result = self.run_cli("--json", "ls", environment=environment)
+            finally:
+                fake.close()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        row = json.loads(result.stdout)[0]
+        self.assertTrue(row["live"], "the port answers, so the pane is live")
+        self.assertIsNone(row["title"], "a title that was not read is not invented")
+        self.assertEqual(row["url"], "https://example.com/", "the recorded address stands in")
+
+    def test_a_block_target_picks_the_pane_to_drive(self) -> None:
+        fake = FakeDevTools(answers="Example Domain")
+        with tempfile.TemporaryDirectory() as home:
+            environment, _, _ = self.pane_environment(Path(home))
+            (Path(home, "state", "rex-ladybird", "tabs")).write_text(
+                f"block:1\t9\thttps://elsewhere.example/\nblock:2\t{fake.port}\thttps://example.com/\n"
+            )
+            try:
+                # The state file points at block:1; -b has to win over it.
+                result = self.run_cli("url", "-b", "block:2", environment=environment)
+                by_suffix = self.run_cli("url", "-b", "2", environment=environment)
+                by_url = self.run_cli("url", "-b", "example.com", environment=environment)
+            finally:
+                fake.close()
+        for result in (result, by_suffix, by_url):
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "https://example.com/")
+
+    def test_an_ambiguous_target_asks_for_the_full_id(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            environment, _, _ = self.pane_environment(Path(home))
+            (Path(home, "state", "rex-ladybird", "tabs")).write_text(
+                "block:2\t9\thttps://a.example/\nblock:12\t10\thttps://b.example/\n"
+            )
+            result = self.run_cli("url", "-b", "2", environment=environment)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("matches 2 panes", result.stderr)
+
+    def test_an_unknown_target_names_the_command_that_lists_panes(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            environment, _, _ = self.pane_environment(Path(home))
+            (Path(home, "state", "rex-ladybird", "tabs")).write_text("block:1\t9\thttps://a.example/\n")
+            result = self.run_cli("url", "-b", "nothing", environment=environment)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no recorded pane matches nothing", result.stderr)
+        self.assertIn("ladyctl ls", result.stderr)
+
+    def test_focus_and_close_take_a_target_to_rex(self) -> None:
+        with tempfile.TemporaryDirectory() as home:
+            environment, log, _ = self.pane_environment(Path(home))
+            focused = self.run_cli("focus", "-b", "block:1", environment=environment)
+            closed = self.run_cli("close", "-b", "block:1", environment=environment)
+            calls = log.read_text().splitlines()
+        self.assertEqual(focused.returncode, 0, focused.stderr)
+        self.assertEqual(closed.returncode, 0, closed.stderr)
+        self.assertEqual(calls, ["focus block:1", "block close block:1"])
 
     def test_a_dead_port_is_not_success(self) -> None:
         # Bind and release, so the port is very likely to be closed.

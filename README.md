@@ -144,7 +144,8 @@ cookies is macOS-only. Windows is untested.
 agents and other tools use the same two surfaces:
 
 ```sh
-ladyctl tabs            # every tab, with its real title and URL
+ladyctl ls              # the panes this module launched: block, port, address, title
+ladyctl tabs            # the tabs inside one pane, with their real titles and URLs
 ladyctl url | title     # current page
 ladyctl links --limit 50
 ladyctl snapshot        # number the controls (e1, e2, …) and read the page text
@@ -156,9 +157,24 @@ echo 'document.title' | ladyctl eval -
 ladyctl wait --text Saved --timeout 10
 ladyctl open https://example.com     # via DevTools, or the APC channel as a fallback
 ladyctl back | forward | reload | quit
+ladyctl focus | close   # hand a pane the keyboard, or close it
 ```
 
 It reads the port and the pane from the same state directory as this module.
+
+**Several panes are open?** `-b` picks which one, by block id, id suffix, or part
+of the address it was opened at, and every command takes it:
+
+```sh
+ladyctl ls                             # block:7  9317  https://example.com/  Example Domain
+ladyctl -b block:7 url                 # the full id
+ladyctl url -b 7                       # the suffix
+ladyctl snapshot -b example.com        # part of the address
+```
+
+Without `-b` a command drives the pane the module last opened, exactly as before.
+A target that names two panes is refused rather than guessed, and `ls` marks the
+panes whose port no longer answers (`live` in `--json`) instead of hiding them.
 
 `snapshot` is what makes the page drivable rather than readable: it marks every
 control it lists with `data-lb-ref`, so `click e3` is that control even after the

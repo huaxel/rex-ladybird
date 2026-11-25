@@ -32,6 +32,8 @@ STATE_DIR = os.path.join(
 )
 BLOCK_FILE = os.path.join(STATE_DIR, "current")
 PORT_FILE = os.path.join(STATE_DIR, "port")
+# One line per pane the module launched: block, port, url.
+TABS_FILE = os.path.join(STATE_DIR, "tabs")
 
 
 # ---------------------------------------------------------------- Rex surface
@@ -50,16 +52,69 @@ def rex(*args: str, check: bool = True) -> subprocess.CompletedProcess:
     return subprocess.run(["rex", *args], capture_output=True, text=True, check=check)
 
 
-def pane_block() -> str:
-    """The Rex block this CLI drives: the pane the module recorded."""
+def registry() -> list[dict]:
+    """The panes the Rex module recorded, in the order it recorded them.
+
+    A pane that has quit leaves its line behind until the module reads the file
+    again, which is why every caller checks whether its port answers instead of
+    trusting the line.
+    """
+    try:
+        with open(TABS_FILE) as file:
+            lines = file.read().splitlines()
+    except OSError:
+        return []
+    panes = []
+    for line in lines:
+        block, _, rest = line.partition("\t")
+        port, _, url = rest.partition("\t")
+        try:
+            number = int(port)
+        except ValueError:
+            continue
+        if block:
+            panes.append({"block": block, "port": number, "url": url})
+    return panes
+
+
+def answers(port: int) -> bool:
+    """Whether a DevTools server is listening, without speaking to it."""
+    try:
+        socket.create_connection(("127.0.0.1", port), timeout=0.5).close()
+        return True
+    except OSError:
+        return False
+
+
+def resolve_pane(target: str) -> dict:
+    """The recorded pane `-b` names: a block id, an id suffix, or part of a url."""
+    panes = registry()
+    if not panes:
+        sys.exit("no Ladybird panes are recorded; open one with the Rex action ladybird_new")
+    for match in (
+        [pane for pane in panes if pane["block"] == target],
+        [pane for pane in panes if pane["block"].endswith(target)],
+        [pane for pane in panes if target.lower() in pane["url"].lower()],
+    ):
+        if len(match) == 1:
+            return match[0]
+        if match:
+            sys.exit(f"{target} matches {len(match)} panes; use the full block id (see: ladyctl ls)")
+    sys.exit(f"no recorded pane matches {target} (see: ladyctl ls)")
+
+
+def pane_block(target: str | None = None) -> str:
+    """The Rex block this CLI drives: the pane `-b` names, or the one recorded."""
+    if target:
+        return resolve_pane(target)["block"]
     block = block_id()
     if not block:
         sys.exit("no Ladybird pane recorded; open one with the Rex action ladybird_new")
     return block
 
 
-def terminal_write(payload: str) -> None:
-    block = pane_block()
+def terminal_write(payload: str, target: str | None = None) -> None:
+    block = pane_block(target)
     result = rex("send", "-b", block, payload, check=False)
     if result.returncode != 0:
         sys.exit(f"could not write to {block}: {result.stderr.strip()}")
@@ -73,8 +128,9 @@ def send_keys(block: str, keys: list[str]) -> None:
         sys.exit(f"could not send {', '.join(keys)} to {block}: {result.stderr.strip()}")
 
 
-def apc(command: str, argument: str = "") -> None:
-    terminal_write(f"\x1b_ladybird;{command};{argument}\x1b\\" if argument else f"\x1b_ladybird;{command}\x1b\\")
+def apc(command: str, argument: str = "", target: str | None = None) -> None:
+    payload = f"\x1b_ladybird;{command};{argument}\x1b\\" if argument else f"\x1b_ladybird;{command}\x1b\\"
+    terminal_write(payload, target)
 
 
 def status_line_url() -> str | None:
@@ -199,9 +255,11 @@ class RDP:
 # -------------------------------------------------------------------- helpers
 
 
-def devtools_port(explicit: int | None) -> int | None:
+def devtools_port(explicit: int | None, block: str | None = None) -> int | None:
     if explicit:
         return explicit
+    if block:
+        return resolve_pane(block)["port"]
     from_environment = os.environ.get("LADYCTL_PORT")
     if from_environment:
         return int(from_environment)
@@ -216,8 +274,8 @@ def no_port_message() -> str:
     return f"no devtools port known: start Ladybird with --devtools=PORT or write the port to {PORT_FILE}"
 
 
-def connect(explicit_port: int | None) -> RDP:
-    port = devtools_port(explicit_port)
+def connect(args) -> RDP:
+    port = devtools_port(args.port, args.block)
     if port is None:
         sys.exit(no_port_message())
     try:
@@ -239,7 +297,7 @@ def emit(args, payload) -> None:
 
 
 def command_tabs(args) -> None:
-    connection = connect(args.port)
+    connection = connect(args)
     reply = connection.request(type="listTabs")
     tabs = [
         {"title": tab.get("title"), "url": tab.get("url"), "actor": tab.get("actor")}
@@ -254,7 +312,7 @@ def command_tabs(args) -> None:
 
 def command_url(args) -> None:
     try:
-        connection = connect(args.port)
+        connection = connect(args)
     except SystemExit:
         url = status_line_url()
         if url is None:
@@ -266,12 +324,12 @@ def command_url(args) -> None:
 
 
 def command_title(args) -> None:
-    connection = connect(args.port)
+    connection = connect(args)
     emit(args, connection.tab().get("title") or "")
 
 
 def command_open(args) -> None:
-    port = devtools_port(args.port)
+    port = devtools_port(args.port, args.block)
     if port is not None:
         try:
             connection = RDP(port)
@@ -283,12 +341,12 @@ def command_open(args) -> None:
             connection.close()
         except (OSError, RuntimeError, TimeoutError):
             pass
-    apc("open", args.url)
+    apc("open", args.url, args.block)
     emit(args, {"opened": args.url, "via": "apc"})
 
 
 def command_history(args) -> None:
-    connection = connect(args.port)
+    connection = connect(args)
     frame = connection.frame()
     reply = connection.request(to=frame["actor"], type="goBack" if args.direction == "back" else "goForward")
     if "error" in reply:
@@ -297,7 +355,7 @@ def command_history(args) -> None:
 
 
 def command_reload(args) -> None:
-    connection = connect(args.port)
+    connection = connect(args)
     frame = connection.frame()
     reply = connection.request(to=frame["actor"], type="reload")
     if "error" in reply:
@@ -306,7 +364,7 @@ def command_reload(args) -> None:
 
 
 def command_eval(args) -> None:
-    connection = connect(args.port)
+    connection = connect(args)
     emit(args, connection.evaluate(args.script))
 
 
@@ -424,7 +482,7 @@ SNAPSHOT_SCRIPT = """(() => {
 
 
 def command_links(args) -> None:
-    connection = connect(args.port)
+    connection = connect(args)
     raw = connection.evaluate(LINKS_SCRIPT % args.limit) or "[]"
     links = json.loads(raw)
     title = connection.tab().get("title") or ""
@@ -436,7 +494,7 @@ def command_links(args) -> None:
 
 
 def command_click(args) -> None:
-    connection = connect(args.port)
+    connection = connect(args)
     outcome = connection.evaluate(CLICK_SCRIPT % json.dumps(args.target))
     # A target that matches nothing is a failed click, not a successful no-op:
     # a caller that goes on to read the page would be reading the wrong page.
@@ -446,7 +504,7 @@ def command_click(args) -> None:
 
 
 def command_snapshot(args) -> None:
-    connection = connect(args.port)
+    connection = connect(args)
     raw = connection.evaluate(SNAPSHOT_SCRIPT) or "{}"
     page = json.loads(raw)
     elements = page.get("elements") or []
@@ -478,8 +536,8 @@ def command_snapshot(args) -> None:
 
 
 def command_type(args) -> None:
-    block = pane_block()
-    connection = connect(args.port)
+    block = pane_block(args.block)
+    connection = connect(args)
     outcome = connection.evaluate(FOCUS_SCRIPT % (json.dumps(args.target), "true" if args.clear else "false"))
     connection.close()
     if outcome == "missing":
@@ -499,13 +557,13 @@ def command_type(args) -> None:
 
 
 def command_press(args) -> None:
-    block = pane_block()
+    block = pane_block(args.block)
     send_keys(block, args.keys)
     emit(args, {"pressed": args.keys})
 
 
 def command_wait(args) -> None:
-    port = devtools_port(args.port)
+    port = devtools_port(args.port, args.block)
     if port is None:
         sys.exit(no_port_message())
     conditions = ["document.readyState === 'complete'"]
@@ -544,14 +602,65 @@ def missing_target(target: str) -> str:
     return f"no element matches {target}"
 
 
+def command_ls(args) -> None:
+    """The panes the module recorded, whether or not they are still alive."""
+    rows = []
+    for pane in registry():
+        row = {"block": pane["block"], "port": pane["port"], "url": pane["url"], "title": None,
+               "live": answers(pane["port"])}
+        if row["live"]:
+            connection = None
+            try:
+                connection = RDP(pane["port"], timeout=5)
+                tab = connection.tab()
+                row["url"] = tab.get("url") or row["url"]
+                row["title"] = tab.get("title")
+            except (OSError, RuntimeError, ConnectionError, TimeoutError):
+                # Listening but not answering yet: the port is the fact worth
+                # reporting, and the title is only a convenience.
+                pass
+            finally:
+                if connection:
+                    connection.close()
+        rows.append(row)
+    if args.json:
+        emit(args, rows)
+        return
+    if not rows:
+        print("no Ladybird panes are recorded")
+    for row in rows:
+        listed = [row["block"], str(row["port"]), row["url"]]
+        if row["title"]:
+            listed.append(row["title"])
+        print("\t".join(listed))
+
+
+def command_focus(args) -> None:
+    # Rex resolves labels and id suffixes itself, so a target here does not have
+    # to be a pane the module launched.
+    block = args.block or pane_block()
+    result = rex("focus", block, check=False)
+    if result.returncode != 0:
+        sys.exit(f"could not focus {block}: {result.stderr.strip()}")
+    emit(args, {"focused": block})
+
+
+def command_close(args) -> None:
+    block = args.block or pane_block()
+    result = rex("block", "close", block, check=False)
+    if result.returncode != 0:
+        sys.exit(f"could not close {block}: {result.stderr.strip()}")
+    emit(args, {"closed": block})
+
+
 def command_chrome(args) -> None:
     """Ask terminal mode to hide or show its own status line (needs the status-line patch)."""
-    apc("chrome", "off" if args.state == "off" else "on")
+    apc("chrome", "off" if args.state == "off" else "on", args.block)
     emit(args, {"status_line": args.state})
 
 
 def command_quit(args) -> None:
-    port = devtools_port(args.port)
+    port = devtools_port(args.port, args.block)
     if port is not None:
         try:
             connection = RDP(port)
@@ -559,13 +668,16 @@ def command_quit(args) -> None:
             connection.close()
         except OSError:
             pass
-    apc("quit")
+    apc("quit", target=args.block)
     emit(args, {"quit": True})
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", type=int, help="devtools port (default: the one the Rex module recorded)")
+    parser.add_argument(
+        "-b", "--block", help="the pane to drive: a block id, an id suffix, or part of a url (default: the recorded pane)"
+    )
     parser.add_argument("--json", action="store_true", help="print machine-readable output")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -573,10 +685,15 @@ def main() -> int:
         sub = subparsers.add_parser(name, help=help_text, **kwargs)
         # SUPPRESS keeps the top-level --port/--json when they are given before the subcommand.
         sub.add_argument("--port", type=int, default=argparse.SUPPRESS, help="devtools port")
+        # SUPPRESS, so `-b` given before the subcommand survives.
+        sub.add_argument("-b", "--block", default=argparse.SUPPRESS, help="the pane to drive")
         sub.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="print machine-readable output")
         sub.set_defaults(handler=handler)
         return sub
 
+    add("ls", "list the panes the module recorded, with their addresses", command_ls)
+    add("focus", "give a pane the keyboard", command_focus)
+    add("close", "close a pane", command_close)
     add("tabs", "list the open tabs with their real titles and URLs", command_tabs)
     add("url", "print the current address", command_url)
     add("title", "print the current page title", command_title)
