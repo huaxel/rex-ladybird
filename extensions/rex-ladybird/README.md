@@ -1,5 +1,8 @@
 # rex-ladybird
 
+Part of [rex-extensions](../../README.md), a collection of ways to extend Rex.
+This one is not only about Rex: the CLI half drives the browser with no Rex at all.
+
 Rex integration for Ladybird's terminal mode (`--headless=terminal`). Rex owns the
 pickers and the layout; Ladybird owns the page.
 
@@ -25,17 +28,17 @@ wheel. Scripts and agents get the same browser from the command line, without Re
 
 ## Install
 
+From the collection, which links this extension where Rex looks for a module and puts
+`ladyctl` on `PATH`:
+
 ```sh
-git clone https://github.com/huaxel/rex-ladybird ~/projects/rex-ladybird
-cd ~/projects/rex-ladybird && ./install.sh
+git clone https://github.com/huaxel/rex-extensions ~/projects/rex-extensions
+cd ~/projects/rex-extensions && ./install.sh rex-ladybird
 ```
 
-That links the checkout where Rex looks for a module, links `ladyctl` into
-`~/.local/bin`, and adds the load line to `~/.config/rex/init.lua`. It asks nothing and
-is safe to run again after a `git pull`. Before it keeps that line it runs
-`rex config check`, and if Rex rejects the result the file is restored: a config that
-no longer loads costs you every key you had. `PREFIX` moves the symlinks somewhere else
-on `PATH`, `REX_CONFIG` installs into another account's config file.
+The installer adds one load line to `~/.config/rex/init.lua` and rolls the file back if
+Rex rejects it: a config that no longer loads costs you every key you had. See the
+[collection README](../../README.md) for `PREFIX`, `REX_CONFIG` and the rest.
 
 Then the keys, in the same `~/.config/rex/init.lua`:
 
@@ -283,7 +286,7 @@ as a reference. Apply it to a checkout and rebuild:
 
 ```sh
 cd path/to/ladybird
-git apply path/to/rex-ladybird/patch/ladybird-status-line.patch
+git apply path/to/rex-extensions/extensions/rex-ladybird/patch/ladybird-status-line.patch
 ./Meta/ladybird.py build
 ```
 
@@ -305,31 +308,24 @@ toolchain fails the build because `Atomic::fetch_update` is deprecated under `-D
 
 ## Tests
 
+This extension's checks are its own:
+
 ```sh
-bash test/run.sh
+bash extensions/rex-ladybird/test/run.sh
 ```
 
-The Lua tests run `init.lua` against `test/fake_rex.lua`, an in-memory Rex that records
-every call, so the command channel, the tab registry, port allocation, the pickers and
-the fallback from DevTools to the status line are checked without a browser. `HOME` and
-`XDG_STATE_HOME` point into a temporary directory, so the registry files are real files
-the tests read back. `run.sh` also runs `test/scope_check.py`, which rejects a name read above the `local`
-that declares it (the trap that makes a helper look nil at run time), and checks that
-the Python helpers compile.
+The Lua suite runs `init.lua` against the collection's fake Rex, so the command
+channel, the tab registry, port allocation, the pickers and the fallback from
+DevTools to the status line are checked without a browser; `test/ladyctl_test.py`
+pins the CLI's exit codes against a fake DevTools server. `HOME` and
+`XDG_STATE_HOME` point into a temporary directory, so the registry files are real
+files the tests read back.
 
-Not covered: the patch itself (needs a compiled browser — see the build recipe above),
-and anything that requires Rex to actually lay out panes.
-
-## Contributing
-
-`bash test/run.sh` runs everything the repository can check without a browser: the Lua
-suite against a fake Rex, the CLI against a fake DevTools server, a scope check and
-shellcheck. CI runs the same script on Linux and macOS. Bug reports are most useful when
-they say which of the two surfaces failed — `ladyctl url` answering while the pane shows
-nothing is a different problem from neither answering.
+Not covered: the patch itself (needs a compiled browser — see the build recipe
+above), and anything that requires Rex to actually lay out panes.
 
 ## License
 
-MIT, see `LICENSE`. `patch/ladybird-status-line.patch` is a diff against
+MIT, see [`LICENSE`](../../LICENSE). `patch/ladybird-status-line.patch` is a diff against
 [Ladybird](https://github.com/LadybirdBrowser/ladybird), which is BSD-2-Clause: the
 patched files stay Ladybird's, and the patch is offered under their terms.

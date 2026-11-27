@@ -10,7 +10,20 @@ local helper = {}
 
 local test_dir = (debug.getinfo(1, "S").source or ""):gsub("^@", ""):match("^(.*)/[^/]*$") or "."
 if test_dir:sub(1, 1) ~= "/" then test_dir = (os.getenv("PWD") or ".") .. "/" .. test_dir end
+-- The repository's test directory, so helper.root is the checkout.
 helper.root = test_dir:match("^(.*)/test$") or (test_dir .. "/..")
+-- The extension under test. This file lives in the repository's test
+-- directory, not beside the test that requires it, so it cannot work out whose
+-- module to load: every test sets this to its own directory first.
+helper.extension_dir = nil
+
+local function module_path()
+  local dir = helper.extension_dir
+  if type(dir) ~= "string" then
+    error("set helper.extension_dir to the extension's directory before loading a module", 0)
+  end
+  return dir .. "/init.lua"
+end
 
 local failed = 0
 
@@ -27,21 +40,18 @@ function helper.check(name, condition, detail)
   end
 end
 
--- A fresh copy of the module, with options that keep it inside the fake's
--- temporary directory.
-function helper.load_module(fake, opts)
-  local merged = {
-    binary = "/tmp/Ladybird.app/Contents/MacOS/Ladybird",
-    ladyctl = "/tmp/ladyctl",
-    chrome_history = fake.tmp .. "/chrome/History",
-    profile = fake.tmp .. "/profile",
-  }
-  for name, value in pairs(opts or {}) do merged[name] = value end
-  -- The module checks that the binary is executable before it opens a pane, so
-  -- the stand-in path has to pass that probe too.
-  fake:on_exec("/bin/test -x " .. merged.binary, { ok = true, stdout = "" })
-  local M = dofile(helper.root .. "/init.lua")
-  return M.setup(merged), M
+-- A fresh copy of the module under test, set up with `opts`. The file is read
+-- again for each call, so a test that changes HOME or the filesystem gets the
+-- defaults a fresh Rex would compute.
+function helper.load_module(opts)
+  local M = dofile(module_path())
+  return M.setup(opts or {}), M
+end
+
+-- The module under test without setup, for the cases setup itself is what is
+-- being checked.
+function helper.read_module()
+  return dofile(module_path())
 end
 
 -- The error a function raises, or nil if it returns.

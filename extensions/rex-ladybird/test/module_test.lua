@@ -1,13 +1,15 @@
 -- Exercises the parts of init.lua that can be checked without a browser: the
 -- command channel, the tab registry, port allocation and the pickers.
 --
---   luajit test/module_test.lua
+--   luajit extensions/rex-ladybird/test/module_test.lua
 
 local here = (debug.getinfo(1, "S").source or ""):gsub("^@", ""):match("^(.*)/[^/]*$") or "."
-package.path = here .. "/?.lua;" .. package.path
+local repo = here .. "/../../.."
+package.path = repo .. "/test/?.lua;" .. package.path
 
 local Fake = require("fake_rex")
 local t = require("helper")
+t.extension_dir = here .. "/.."
 
 local fake = Fake.install()
 local terminal = "com.superlogical.terminal"
@@ -20,7 +22,17 @@ local function tabs_file() return state_dir() .. "/tabs" end
 local function fresh(opts)
   fake:reset()
   os.execute("rm -rf '" .. state_dir() .. "'")
-  local M = t.load_module(fake, opts)
+  local merged = {
+    binary = "/tmp/Ladybird.app/Contents/MacOS/Ladybird",
+    ladyctl = "/tmp/ladyctl",
+    chrome_history = fake.tmp .. "/chrome/History",
+    profile = fake.tmp .. "/profile",
+  }
+  for name, value in pairs(opts or {}) do merged[name] = value end
+  -- The module checks that the binary is executable before it opens a pane, so
+  -- the stand-in path has to pass that probe too.
+  fake:on_exec("/bin/test -x " .. merged.binary, { ok = true, stdout = "" })
+  local M = t.load_module(merged)
   local session = fake:add_session()
   fake:add_block(session, "block:1", "Ladybird")
   fake:add_block(session, "block:2", "Ladybird")
@@ -362,7 +374,7 @@ do
   -- that has never seen this checkout.
   local function load_defaults()
     fake:reset()
-    return dofile(t.root .. "/init.lua")
+    return dofile(t.extension_dir .. "/init.lua")
   end
 
   os.execute("mkdir -p '" .. fake.tmp .. "/home/.config/google-chrome/Default'")

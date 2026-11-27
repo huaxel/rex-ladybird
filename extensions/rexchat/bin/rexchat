@@ -1,0 +1,858 @@
+#!/usr/bin/env python3
+"""Serve a read-only, chat-shaped view of Rex sessions in a browser.
+
+Rex already holds what a chat client needs: sessions and their labels, the
+blocks inside them, each program's own claim about what it is doing (the
+Program Status Protocol, OSC 7501), and the terminal output itself. What it has
+no view for is a thumb: a list sorted into "needs you" and "done", and one pane
+of text instead of a tiled screen.
+
+This is the smallest version of that view, and it only reads. There is no
+endpoint that writes to a terminal, so nothing here can type into your work:
+
+    GET /                       the page
+    GET /api/sessions           sessions, their blocks, and each one's state
+    GET /api/transcript?block=  one block's output as text
+    GET /api/stream             server-sent events: what changed, as it changes
+
+It drives the `rex` on PATH (REX_BIN overrides it) rather than speaking the
+server's socket protocol, so it needs no plugin, no Rex version beyond the CLI,
+and no state of its own. `rex events --json --all` runs in the background and the
+page follows it, so reported status changes refresh
+the sidebar. Terminal output is still fetched as snapshots.
+
+Still not built: the prompt card a real `rex.ui` question produces. Those arrive
+as `client_prompt_requested` on a *client's* own connection, so a wrapper built on
+the CLI never sees them; it would have to be a Rex client, not a reader of one.
+
+    python3 bin/rexchat --port 8787      # then open the URL it prints
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import re
+import signal
+import subprocess
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+REX_BIN = os.environ.get("REX_BIN") or "rex"
+# A block ID reaches rex as an argv element, so there is no shell to inject into,
+# but a leading dash would read as a flag. Only accept what Rex itself emits.
+BLOCK_ID = re.compile(r"\Ablock:[A-Za-z0-9][A-Za-z0-9:._-]*\Z")
+# How much a state wants a person, straight from the program status protocol.
+ATTENTION = {"error": 4, "blocked": 3, "working": 2, "done": 1, "idle": 0}
+# The server lowers anything above 960 KiB, and a refused reply fails the call.
+MAX_FORMAT_BYTES = 983_040
+DEFAULT_TAIL = 24_000
+# A browser left open polls; one second of cache keeps that from spawning a rex
+# process per block per client.
+CACHE_SECONDS = 1.0
+# Each live connection holds a thread; a person needs one, and a forgotten tab
+# should not cost more than a few.
+MAX_STREAMS = 8
+HEARTBEAT_SECONDS = 15.0
+
+
+class RexError(Exception):
+    """Rex did not answer, or answered with something that is not a result."""
+
+
+def rex(*args: str, timeout: float = 15.0) -> dict:
+    try:
+        result = subprocess.run([REX_BIN, "--autostart=false", *args], capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        raise RexError(f"{REX_BIN} is not on PATH; install Rex or set REX_BIN")
+    except subprocess.TimeoutExpired:
+        raise RexError(f"rex {args[0]} did not answer within {timeout:g}s")
+    if result.returncode != 0:
+        raise RexError(result.stderr.strip() or f"rex {args[0]} exited {result.returncode}")
+    try:
+        return json.loads(result.stdout)
+    except ValueError:
+        raise RexError(f"rex {args[0]} printed no JSON")
+
+
+def decoded(value: object) -> str | None:
+    """The status protocol base64s its free text, and allows unpadded input."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        raw = base64.b64decode(value + "=" * (-len(value) % 4), validate=True)
+    except Exception:
+        # A program that reported plain text is wrong, not interesting.
+        return value
+    return raw.decode("utf-8", "replace") or None
+
+
+def status_of(block: str) -> dict:
+    """What the programs in one block say they are doing, worst first.
+
+    A terminal holds one record per reporting program, and one of them waiting on
+    a person is the only thing worth surfacing when forty sessions are in play,
+    so the reply is folded down to the most attention-hungry record.
+    """
+    records = rex("block", "call", "-b", block, "program_status").get("records") or []
+    best: tuple[int, dict, str] = (-1, {}, "idle")
+    for record in records:
+        state = str(record.get("state") or "idle").lower()
+        if ATTENTION.get(state, 0) > best[0]:
+            best = (ATTENTION.get(state, 0), record, state)
+    _, record, state = best
+    return {
+        "state": state,
+        "kind": record.get("kind"),
+        "app": record.get("effective_app") or record.get("app"),
+        "message": decoded(record.get("msg")),
+        "progress": record.get("progress"),
+    }
+
+
+def safe_status(block: str) -> dict:
+    """One dead or slow block must not empty the session list."""
+    try:
+        return status_of(block)
+    except RexError as error:
+        return {"state": "unknown", "app": None, "message": str(error)}
+
+
+def pmap(function, items: list) -> list:
+    items = list(items)
+    if not items:
+        return []
+    with ThreadPoolExecutor(max_workers=min(8, len(items))) as pool:
+        return list(pool.map(function, items))
+
+
+def worst(states: list[str]) -> str:
+    return max(states, key=lambda state: ATTENTION.get(state, 0), default="idle")
+
+
+def describe_session(listing: dict) -> dict:
+    session_id = listing.get("session_id") or ""
+    blocks = rex("block", "ls", "-s", session_id, "--json").get("blocks") or []
+    # Other block types exist; a chat view only has something to show for a
+    # terminal, and the rest are named in neither the list nor the transcript.
+    terminals = [block for block in blocks if block.get("creator_name") == "com.superlogical.terminal"]
+    statuses = pmap(lambda block: safe_status(block.get("block_id") or ""), terminals)
+    described = []
+    for block, status in zip(terminals, statuses):
+        described.append({"id": block.get("block_id"), "label": block.get("label") or "terminal", **status})
+    states = [block["state"] for block in described]
+    return {
+        "id": session_id,
+        "label": listing.get("label") or session_id,
+        "state": worst(states),
+        "needs_you": any(state == "blocked" for state in states),
+        "blocks": described,
+    }
+
+
+class Sessions:
+    """Who is doing what, cached for a second."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.at = 0.0
+        self.generation = 0
+        self.value: list[dict] | None = None
+
+    def invalidate(self) -> None:
+        """Make the next read go to Rex, because an event said something changed."""
+        with self.lock:
+            self.at = 0.0
+            self.generation += 1
+
+    def read(self) -> list[dict]:
+        with self.lock:
+            if self.value is not None and self.at and time.monotonic() - self.at < CACHE_SECONDS:
+                return self.value
+            generation = self.generation
+        listings = rex("ls", "--json").get("sessions") or []
+        described = pmap(describe_session, listings)
+        # Whoever needs a person comes first; the rest keep Rex's order.
+        described.sort(key=lambda session: (not session["needs_you"], session["state"] != "error"))
+        with self.lock:
+            if generation == self.generation:
+                self.value, self.at = described, time.monotonic()
+        return described
+
+
+SESSIONS = Sessions()
+
+
+class Watcher:
+    """Follow `rex events`, and let browsers wait for what changed.
+
+    The stream is the difference between a page that guesses and one that knows:
+    a session becoming `blocked` is an event, so the list re-sorts while the person
+    is looking at it instead of up to a poll later. Rex writes one JSON object per
+    line and flushes each, so this is a read loop rather than a protocol.
+
+    Progress reports are not terminal output notifications. Ignore those and
+    let the browser poll only the selected transcript when Follow is enabled.
+    """
+
+    # Events that change the session list: which sessions exist, what is in them,
+    # and which of them now wants a person.
+    LIST = {"session_view_changed", "session_label_changed", "block_created", "block_closed"}
+    BLOCK_STATE = {"program_status_changed", "program_status_removed"}
+
+    def __init__(self, sessions: Sessions) -> None:
+        self.sessions = sessions
+        self.condition = threading.Condition()
+        self.revision = 0
+        self.list_revision = 0
+        self.stopping = threading.Event()
+        self.process = None
+        self.state = "starting"
+        self.error = ""
+
+    # ------------------------------------------------------------------ thread
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self.follow, name="rex-events", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.stopping.set()
+        with self.condition:
+            if self.process is not None:
+                self.process.terminate()
+        self.thread.join(timeout=6)
+
+    def follow(self) -> None:
+        """Keep a stream open, and say so when it is not.
+
+        A server restart or a laptop sleeping ends the stream without an error
+        anyone can see, so this reconnects for as long as the view runs and backs
+        off instead of spinning on a Rex that is not there.
+        """
+        delay = 0.5
+        while not self.stopping.is_set():
+            try:
+                process = subprocess.Popen(
+                    [REX_BIN, "--autostart=false", "events", "--json", "--all"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+            except OSError as error:
+                self.note("down", f"{REX_BIN} events: {error}")
+                self.stopping.wait(delay)
+                delay = min(delay * 2, 8.0)
+                continue
+            with self.condition:
+                self.process = process
+                if self.stopping.is_set():
+                    process.terminate()
+            self.sessions.invalidate()
+            self.note("live", "", refresh=True)
+            assert process.stdout is not None
+            try:
+                for line in process.stdout:
+                    delay = 0.5
+                    self.absorb(line)
+            except OSError:
+                pass
+            finally:
+                # stdout closing means it is going, but a wedged connection is
+                # not worth leaving behind for the life of the view.
+                if process.poll() is None:
+                    process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                with self.condition:
+                    self.process = None
+                process.stdout.close()
+            self.note("down", "the event stream ended; reconnecting")
+            self.stopping.wait(delay)
+            delay = min(delay * 2, 8.0)
+
+    def note(self, state: str, error: str, refresh: bool = False) -> None:
+        with self.condition:
+            if (self.state, self.error) != (state, error):
+                self.state, self.error = state, error
+                self.list_revision += int(refresh)
+                self.revision += 1
+                self.condition.notify_all()
+
+    def absorb(self, line: str) -> None:
+        try:
+            event = json.loads(line)
+        except ValueError:
+            return
+        if not isinstance(event, dict):
+            return
+        kind = event.get("type")
+        changes_list = kind in {"session_created", "session_destroyed"}
+        if kind == "session_event":
+            inner = (event.get("payload") or {}).get("event") or {}
+            name = inner.get("type")
+            changes_list = name in self.LIST or (
+                name == "block_event" and (inner.get("payload") or {}).get("name") in self.BLOCK_STATE
+            )
+        if changes_list:
+            self.sessions.invalidate()
+            with self.condition:
+                self.list_revision += 1
+                self.revision += 1
+                self.condition.notify_all()
+
+    # --------------------------------------------------------------- for pages
+
+    def wait(self, seen_revision: int, timeout: float) -> int:
+        with self.condition:
+            self.condition.wait_for(lambda: self.revision != seen_revision, timeout)
+            return self.revision
+
+    def snapshot(self) -> tuple[int, int, str, str]:
+        with self.condition:
+            return self.revision, self.list_revision, self.state, self.error
+
+
+WATCHER = Watcher(SESSIONS)
+
+
+def transcript(block: str, tail: int) -> dict:
+    """One block's output, as text, ending at the newest line.
+
+    `format` returns the screen and scrollback from the oldest line, so a short
+    budget is taken off the end here. When the scrollback is larger than one
+    reply the head is all the server sends and the tail is not available; the
+    reply says so instead of pretending the truncated end is the current state.
+    """
+    request = json.dumps(
+        {"format": "text", "trim": True, "unwrap": True, "max_bytes": MAX_FORMAT_BYTES}
+    )
+    reply = rex("block", "call", "-b", block, "format", request)
+    content = reply.get("content") or ""
+    truncated = "id" in reply
+    trimmed = len(content) > tail
+    if trimmed and not truncated:
+        content = content[-tail:]
+    try:
+        title = rex("block", "call", "-b", block, "title").get("title") or ""
+    except RexError:
+        title = ""
+    return {
+        "block": block,
+        "title": title,
+        "content": content,
+        "truncated": truncated,
+        "trimmed": trimmed and not truncated,
+    }
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "rexchat"
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt: str, *args: object) -> None:  # noqa: D102 - quieter than the default
+        pass
+
+    def send(self, status: int, content_type: str, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def json(self, status: int, value: dict) -> None:
+        self.send(status, "application/json", json.dumps(value).encode())
+
+    def fail(self, status: int, message: str) -> None:
+        self.json(status, {"error": message})
+
+    def do_HEAD(self) -> None:
+        self.do_GET()
+
+    def do_POST(self) -> None:
+        # Nothing here writes to a terminal, on purpose: a read-only view cannot
+        # type into someone's running work, and its worst failure is a stale page.
+        self.fail(405, "this view only reads; there is no endpoint that writes to a terminal")
+
+    def do_GET(self) -> None:
+        port = self.server.server_port
+        hosts = self.headers.get_all("Host", [])
+        if hosts not in ([f"127.0.0.1:{port}"], [f"localhost:{port}"]):
+            self.fail(403, "this view only accepts loopback hosts")
+            return
+        url = urlparse(self.path)
+        try:
+            if url.path in ("/", "/index.html"):
+                self.send(200, "text/html; charset=utf-8", PAGE.encode())
+            elif url.path == "/api/sessions":
+                self.json(200, {"sessions": SESSIONS.read()})
+            elif url.path == "/api/transcript":
+                self.transcript(parse_qs(url.query))
+            elif url.path == "/api/stream":
+                if self.command == "HEAD":
+                    self.send(200, "text/event-stream", b"")
+                else:
+                    self.stream()
+            else:
+                self.fail(404, f"no such path: {url.path}")
+        except RexError as error:
+            self.fail(502, str(error))
+        except BrokenPipeError:
+            # The browser navigated away mid-reply; nothing to report.
+            pass
+
+    def stream(self) -> None:
+        """Server-sent events: what changed since this page last asked.
+
+        Each frame says whether the cached session list needs refreshing.
+        Heartbeats keep quiet connections open.
+        """
+        if not self.server.claim_stream():
+            self.fail(503, f"{MAX_STREAMS} live views are already open")
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            seen, seen_list = -1, -1
+            while True:
+                if seen >= 0:
+                    revision = WATCHER.wait(seen, HEARTBEAT_SECONDS)
+                    if revision == seen:
+                        self.wfile.write(b": heartbeat\n\n")
+                        self.wfile.flush()
+                        continue
+                revision, list_revision, state, error = WATCHER.snapshot()
+                frame = {
+                    "revision": revision,
+                    "state": state,
+                    "error": error,
+                    "sessions": list_revision != seen_list,
+                }
+                self.wfile.write(f"data: {json.dumps(frame)}\n\n".encode())
+                self.wfile.flush()
+                seen, seen_list = revision, list_revision
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            self.server.release_stream()
+
+    def transcript(self, query: dict) -> None:
+        block = (query.get("block") or [""])[0]
+        if not BLOCK_ID.match(block):
+            self.fail(400, "block must be a Rex block ID, as in block:01a2…")
+            return
+        tail = self.server.tail
+        asked = (query.get("tail") or [""])[0]
+        if asked:
+            try:
+                tail = max(1_000, min(int(asked), 400_000))
+            except ValueError:
+                self.fail(400, "tail must be a number of characters")
+                return
+        self.json(200, transcript(block, tail))
+
+
+class Server(ThreadingHTTPServer):
+    """One port, a few live views, and the tail length every transcript uses."""
+
+    daemon_threads = True
+    tail = DEFAULT_TAIL
+
+    def __init__(self, address: tuple[str, int], handler: type[BaseHTTPRequestHandler]) -> None:
+        super().__init__(address, handler)
+        self.streams = 0
+        self.stream_lock = threading.Lock()
+
+    def claim_stream(self) -> bool:
+        with self.stream_lock:
+            if self.streams >= MAX_STREAMS:
+                return False
+            self.streams += 1
+            return True
+
+    def release_stream(self) -> None:
+        with self.stream_lock:
+            self.streams = max(0, self.streams - 1)
+
+
+PAGE = """<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rex sessions</title>
+<style>
+  :root { color-scheme: dark; --bg:#14161a; --panel:#1b1e24; --line:#2b303a;
+          --text:#dfe3ea; --dim:#8b93a1; --accent:#7aa2f7;
+          --blocked:#e0af68; --error:#f7768e; --working:#9ece6a; --done:#6b7280; }
+  * { box-sizing: border-box; }
+  body { margin:0; height:100vh; height:100dvh; display:flex; font:14px/1.45 ui-sans-serif, system-ui, sans-serif;
+         background:var(--bg); color:var(--text); }
+  aside { width:19rem; flex:none; border-right:1px solid var(--line); overflow-y:auto;
+          background:var(--panel); padding:.5rem; }
+  aside h1 { font-size:.72rem; letter-spacing:.08em; text-transform:uppercase; color:var(--dim);
+             margin:.9rem .5rem .35rem; }
+  .session { margin:.15rem 0 .5rem; }
+  .session > .name { display:flex; gap:.5rem; align-items:center; padding:.25rem .5rem;
+                     color:var(--dim); font-size:.8rem; overflow:hidden; }
+  .session > .name span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  button.block { display:flex; gap:.55rem; align-items:center; width:100%; text-align:left;
+                 padding:.5rem; border:1px solid transparent; border-radius:.5rem;
+                 background:none; color:var(--text); font:inherit; cursor:pointer; }
+  button { min-block-size:24px; min-inline-size:24px; }
+  button.block:hover { background:#222731; }
+  button.block[aria-current="true"] { background:#262c38; border-color:var(--line); }
+  button.block .where { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  button.block .app { color:var(--dim); font-size:.75rem; }
+  .dot { width:.55rem; height:.55rem; border-radius:50%; flex:none; background:var(--done); }
+  .dot.blocked { background:var(--blocked); box-shadow:0 0 0 3px #e0af6833; }
+  .dot.error { background:var(--error); }
+  .dot.working { background:var(--working); animation:pulse 1.4s ease-in-out infinite; }
+  .dot.unknown { background:var(--line); }
+  @keyframes pulse { 50% { opacity:.3; } }
+  main { flex:1; min-width:0; display:flex; flex-direction:column; overflow:auto; }
+  header { display:flex; flex-wrap:wrap; gap:.75rem; align-items:center; padding:.65rem .9rem;
+           border-bottom:1px solid var(--line); }
+  header #label { font-weight:600; margin:0; font-size:1rem; }
+  header .identity { min-width:0; flex:1 1 12rem; overflow-wrap:anywhere; }
+  header .controls { display:flex; flex-wrap:wrap; align-items:center; gap:.5rem; }
+  #back { display:none; }
+  header #dot { display:inline-block; }
+  header #state { font-size:.75rem; color:var(--dim); }
+  header #live { font-size:.72rem; color:var(--dim); display:flex; align-items:center; gap:.35rem; }
+  header button { font:inherit; font-size:.78rem; color:var(--text); background:#262c38;
+                  border:1px solid var(--line); border-radius:.4rem; padding:.3rem .6rem; cursor:pointer; }
+  header button[aria-pressed="true"] { border-color:var(--accent); color:var(--accent); }
+  #note { margin:0; padding:.35rem .9rem; font-size:.78rem; color:var(--dim); }
+  #note[data-warn="true"] { color:var(--blocked); }
+  pre { flex:1; min-block-size:5rem; margin:0; padding:.6rem .9rem 3rem; overflow:auto; white-space:pre-wrap;
+        overflow-wrap:anywhere; font:.8125rem/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #list-error { color:var(--blocked); margin:.5rem; overflow-wrap:anywhere; }
+  #list-error:empty { margin:0; }
+  @media (max-width: 42rem) {
+    aside { width:100%; border-right:0; }
+    body:not([data-detail]) main, body[data-detail] aside { display:none; }
+    #back { display:inline-block; }
+    header .identity { flex-basis:100%; }
+    button { min-block-size:44px; min-inline-size:44px; }
+  }
+  @media (pointer: coarse) {
+    button { min-block-size:44px; min-inline-size:44px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .dot.working { animation:none; }
+  }
+</style>
+<aside aria-label="Sessions" tabindex="-1" id="sidebar">
+  <p id="list-error" role="status"></p>
+  <div id="sessions"><h1>Reading Rex…</h1></div>
+</aside>
+<main>
+  <header>
+    <div class="identity">
+      <h1 id="label" tabindex="-1">No block selected</h1>
+      <span class="dot" id="dot" aria-hidden="true"></span>
+      <span id="state"></span>
+    </div>
+    <div class="controls">
+      <button id="back" type="button">← Sessions</button>
+      <button id="follow" aria-pressed="true" title="Reload the selected transcript periodically">Follow</button>
+      <button id="refresh">Refresh</button>
+      <span id="live"><span class="dot working" id="livedot" aria-hidden="true"></span><span id="livetext">connecting</span></span>
+    </div>
+  </header>
+  <p id="note">Read-only. Type in the terminal, not here.</p>
+  <pre id="text" tabindex="0" role="region" aria-label="Terminal output"></pre>
+</main>
+<script>
+const narrow = matchMedia("(max-width: 42rem)");
+const sidebar = document.getElementById("sidebar");
+const listError = document.getElementById("list-error");
+const rows = document.getElementById("sessions");
+const text = document.getElementById("text");
+const label = document.getElementById("label");
+const dot = document.getElementById("dot");
+const state = document.getElementById("state");
+const note = document.getElementById("note");
+const live = document.getElementById("live");
+const livedot = document.getElementById("livedot");
+const livetext = document.getElementById("livetext");
+const follow = document.getElementById("follow");
+let selected = null;      // block id
+let listTimer = null;
+let listBusy = false;
+let listDirty = false;
+let transcriptBusy = false;
+let safety = null;        // fallback poll, only while the stream is not open
+
+async function get(url) {
+  const response = await fetch(url, { cache: "no-store" });
+  const body = await response.json().catch(() => null);
+  if (!response.ok) throw new Error((body && body.error) || response.statusText);
+  return body;
+}
+
+function say(message, warn) {
+  note.textContent = message;
+  note.dataset.warn = warn ? "true" : "false";
+}
+
+function blockRow(block) {
+  const row = document.createElement("button");
+  row.className = "block";
+  row.dataset.block = block.id;
+  row.setAttribute("aria-current", block.id === selected ? "true" : "false");
+  const light = document.createElement("span");
+  light.className = "dot " + block.state;
+  light.title = block.state + (block.kind ? " (" + block.kind + ")" : "");
+  const where = document.createElement("span");
+  where.className = "where";
+  // Rex labels a block by its program, so several terminals are all "shell".
+  // The reporting program is the part that tells them apart.
+  const generic = ["shell", "terminal", "login"].includes(block.label.toLowerCase());
+  where.textContent = generic && block.app ? block.app : block.label;
+  const app = document.createElement("span");
+  app.className = "app";
+  app.textContent = block.state === "blocked" ? block.kind || "needs you" : generic ? "" : block.app || "";
+  row.append(light, where, app);
+  row.addEventListener("click", () => {
+    if (narrow.matches) document.body.setAttribute("data-detail", "");
+    choose(block);
+    if (narrow.matches) label.focus();
+  });
+  return row;
+}
+
+function heading(text) {
+  const element = document.createElement("h1");
+  element.textContent = text;
+  return element;
+}
+
+function rowFor(id) {
+  return rows.querySelector(`button[data-block="${CSS.escape(id)}"]`);
+}
+
+function focusSessions(id) {
+  (id && rowFor(id) || sidebar).focus({ preventScroll: true });
+}
+
+function render(sessions) {
+  const focused = rows.contains(document.activeElement) ? document.activeElement.dataset.block : null;
+  rows.replaceChildren();
+  if (!sessions.length) {
+    rows.append(heading("No sessions"));
+    if (focused) focusSessions(null);
+    return;
+  }
+  // Two lists, not one: a single heading over everything read as though every
+  // session below it wanted a person.
+  const waiting = sessions.filter((session) => session.needs_you);
+  const rest = sessions.filter((session) => !session.needs_you);
+  if (waiting.length) {
+    rows.append(heading("Needs you (" + waiting.length + ")"));
+    for (const session of waiting) rows.append(sessionGroup(session));
+  }
+  if (rest.length) {
+    rows.append(heading(waiting.length ? "Everything else" : "Sessions"));
+    for (const session of rest) rows.append(sessionGroup(session));
+  }
+  if (focused) focusSessions(focused);
+}
+
+function sessionGroup(session) {
+  const group = document.createElement("div");
+  group.className = "session";
+  const name = document.createElement("div");
+  name.className = "name";
+  const light = document.createElement("span");
+  light.className = "dot " + session.state;
+  const text = document.createElement("span");
+  text.textContent = session.label;
+  name.append(light, text);
+  group.append(name);
+  for (const block of session.blocks) group.append(blockRow(block));
+  if (!session.blocks.length) {
+    const none = document.createElement("div");
+    none.className = "name";
+    none.textContent = "no terminals";
+    group.append(none);
+  }
+  return group;
+}
+
+async function loadSessions() {
+  if (listBusy) { listDirty = true; return; }
+  listBusy = true;
+  try {
+    const body = await get("/api/sessions");
+    listError.textContent = "";
+    render(body.sessions);
+    const blocks = body.sessions.flatMap((s) => s.blocks);
+    const current = blocks.find((block) => block.id === selected);
+    if (current) showStatus(current);
+    else if (!narrow.matches && blocks.length) choose(blocks[0]);
+    else {
+      const wasDetail = document.body.hasAttribute("data-detail");
+      document.body.removeAttribute("data-detail");
+      if (narrow.matches && wasDetail) focusSessions(null);
+      selected = null;
+      text.textContent = "";
+      label.textContent = "No block selected";
+      state.textContent = "";
+      dot.className = "dot";
+    }
+  } catch (error) {
+    listError.textContent = "Rex: " + error.message;
+  } finally {
+    listBusy = false;
+    if (listDirty) { listDirty = false; scheduleSessions(); }
+  }
+}
+
+async function loadTranscript(block) {
+  const body = await get("/api/transcript?block=" + encodeURIComponent(block));
+  if (block !== selected) return;              // a slower reply for a block the person left
+  const atBottom = text.scrollHeight - text.scrollTop - text.clientHeight < 40;
+  text.textContent = body.content;
+  if (atBottom) text.scrollTop = text.scrollHeight;
+  label.textContent = body.title || block;
+  if (body.truncated) {
+    say("This terminal holds more output than one reply: what you see starts at the oldest line.", true);
+  } else if (body.trimmed) {
+    say("Showing the end of the scrollback. Read-only — type in the terminal, not here.", false);
+  } else {
+    say("Read-only. Type in the terminal, not here.", false);
+  }
+}
+
+function setLive(state, detail) {
+  const known = { live: "working", connecting: "working", down: "blocked" };
+  livedot.className = "dot " + (known[state] || "unknown");
+  livetext.textContent = state === "live" ? "live" : detail || state;
+  live.title = detail || state;
+}
+
+function showStatus(block) {
+  dot.className = "dot " + block.state;
+  state.textContent = block.state + (block.kind ? " · " + block.kind : "") + (block.message ? " · " + block.message : "");
+}
+
+async function choose(block) {
+  selected = block.id;
+  text.textContent = "";
+  label.textContent = block.label;
+  showStatus(block);
+  for (const row of rows.querySelectorAll("button.block")) {
+    row.setAttribute("aria-current", row.dataset.block === block.id ? "true" : "false");
+  }
+  try { await loadTranscript(block.id); }
+  catch (error) { if (block.id === selected) say("Rex: " + error.message, true); }
+}
+
+function setFollow(on) {
+  follow.setAttribute("aria-pressed", on ? "true" : "false");
+}
+
+function scheduleSessions() {
+  if (listTimer !== null) return;
+  listTimer = setTimeout(() => { listTimer = null; loadSessions(); }, 300);
+}
+
+function connectionState(state, detail) {
+  setLive(state, detail);
+  if (state === "live") {
+    if (safety !== null) clearInterval(safety);
+    safety = null;
+  } else if (safety === null) {
+    safety = setInterval(loadSessions, 5000);
+  }
+}
+
+function connect() {
+  const source = new EventSource("/api/stream");
+  source.onmessage = (message) => {
+    const frame = JSON.parse(message.data);
+    connectionState(frame.state, frame.error);
+    if (frame.sessions) scheduleSessions();
+  };
+  source.onerror = () => connectionState("connecting", "reconnecting");
+}
+
+async function refreshTranscript() {
+  if (!selected || transcriptBusy) return;
+  const block = selected;
+  transcriptBusy = true;
+  try { await loadTranscript(block); }
+  catch (error) { if (block === selected) say("Rex: " + error.message, true); }
+  finally { transcriptBusy = false; }
+}
+
+setInterval(() => {
+  const showingDetail = !narrow.matches || document.body.hasAttribute("data-detail");
+  if (showingDetail && !document.hidden && follow.getAttribute("aria-pressed") === "true") refreshTranscript();
+}, 2000);
+
+document.getElementById("back").addEventListener("click", () => {
+  document.body.removeAttribute("data-detail");
+  focusSessions(selected);
+});
+narrow.addEventListener("change", () => {
+  if (!narrow.matches && !selected) loadSessions();
+});
+follow.addEventListener("click", () => setFollow(follow.getAttribute("aria-pressed") !== "true"));
+document.getElementById("refresh").addEventListener("click", () => {
+  refreshTranscript();
+  loadSessions();
+});
+setFollow(true);
+loadSessions();
+connect();
+</script>
+</html>
+"""
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--port", type=int, default=8787, help="port to listen on; 0 picks a free one")
+    parser.add_argument("--tail", type=int, default=DEFAULT_TAIL, help="characters of scrollback to show")
+    args = parser.parse_args()
+
+    server = Server(("127.0.0.1", args.port), Handler)
+    server.tail = max(1_000, args.tail)
+    print(f"http://127.0.0.1:{server.server_port}/", flush=True)
+
+    def stop_on_signal(signum, frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop_on_signal)
+    WATCHER.start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print()
+    finally:
+        WATCHER.stop()
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

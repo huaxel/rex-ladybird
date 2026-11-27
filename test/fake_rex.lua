@@ -18,7 +18,7 @@ end
 local function temp_dir()
   local base = (os.getenv("TMPDIR") or "/tmp"):gsub("/+$", "")
   local seed = tostring(os.time()):sub(-6) .. tostring(math.random(1, 1e6))
-  local dir = base .. "/rex-ladybird-test." .. seed
+  local dir = base .. "/rex-ext-test." .. seed
   os.execute("mkdir -p " .. shell_quote(dir .. "/home/state") .. " " .. shell_quote(dir .. "/home/data"))
   return dir
 end
@@ -189,6 +189,8 @@ function Fake:api()
           return fake.process[block_id]
         elseif method == "write" then
           return { ok = true }
+        elseif method == "set_theme" then
+          return { ok = true, theme = (params or {}).background }
         end
         return nil
       end,
