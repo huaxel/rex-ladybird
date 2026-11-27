@@ -16,7 +16,14 @@ Then `rex do terminal_theme` applies Tokyo Night to the block you are in, or pic
 | --- | --- | --- |
 | `theme` | `"tokyo-night"` | the palette `terminal_theme` applies when it is not given one |
 
-`rex do terminal_theme theme=tokyo-night` names a theme explicitly. A theme's palette
+`rex do terminal_theme theme=tokyo-night` names a theme explicitly.
+
+**A palette cannot be unset, only replaced.** `set_theme` treats palette entries as
+deltas: sending empty `foreground`/`background`/`cursor` returns those to the
+built-in colors, but a slot you changed stays changed until the block is closed —
+a new block starts from the built-in palette. Verified against a live terminal:
+`format` with `extra_palette` still reports the applied slots after an empty
+`set_theme`. A theme's palette
 entries are `index=#RRGGBB` for the terminal's own slots: Tokyo Night sets 0–21 (0–7
 normal, 8–15 bright, 16–21 beyond those), and any slot a theme leaves out keeps its
 built-in color. The terminal's palette runs to 255.

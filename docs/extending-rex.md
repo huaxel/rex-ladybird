@@ -163,7 +163,9 @@ where), `pwd`, `program_status` (the OSC 7501 protocol behind "needs you"), `por
 
 **Two rules worth knowing.** Some methods (`set_theme`, `resize`) apply at once only if
 the caller owns the block or no client does; otherwise they wait for ownership, and an
-extension should say so rather than pretend. And reading a terminal's screen is a
+extension should say so rather than pretend. And `set_theme` is partly appending: empty
+color fields fall back to the built-in colors, but palette slots are deltas that stay
+until the block is closed, so "apply a theme" has no matching "unapply". And reading a terminal's screen is a
 snapshot, not a stream — `data.connect` is the streaming door, and it is a different
 kind of program (a client, not a module).
 
