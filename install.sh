@@ -37,41 +37,36 @@ every_extension() {
     done
 }
 
+usage() {
+    # The header above is the usage text; printing it from there keeps the two
+    # in step when a flag is added.
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+}
+
 require_python() {
     command -v python3 >/dev/null 2>&1 ||
         fail "the extension '$1' ships a python helper and python3 is not on PATH"
 }
 
-# 1. What has to be there already. Rex is not optional: without it these are
-#    modules nothing loads. A missing browser build is only a warning, because
-#    a pane opened before the build exists says so itself.
-command -v rex >/dev/null 2>&1 ||
-    fail "the rex command is not on PATH. See https://www.superlogical.com/rex/docs/installation"
-[ -f "$here/init.lua" ] && [ -d "$extdir" ] || fail "$here does not look like a rex-extensions checkout"
-
+# 1. What this checkout is. Checked before anything is touched, in both
+#    directions: an installer that guesses at the wrong directory removes links.
 remove=0
 case "${1:-}" in
+    -h|--help)
+        usage
+        exit 0
+        ;;
     --remove|-r)
         remove=1
         shift
         [ "$#" -gt 0 ] || fail "which extension? usage: ./install.sh --remove NAME [NAME...]"
         ;;
 esac
+[ -f "$here/init.lua" ] && [ -d "$extdir" ] || fail "$here does not look like a rex-extensions checkout"
 
-if [ "$#" -eq 0 ]; then
-    # The output is one name per line and the split is the point.
-    # shellcheck disable=SC2046
-    set -- $(every_extension)
-    [ "$#" -gt 0 ] || fail "$extdir has no extensions in it"
-fi
-
-selected=""
-for name in "$@"; do
-    [ -d "$extdir/$name" ] || fail "no extension called '$name' (this checkout has: $(every_extension | tr '\n' ' '))"
-    selected="$selected $name"
-done
-
-# Removing does not need Rex on PATH: nothing is loaded and no config changes.
+# 2. Removing. No Rex on PATH and no config edit: the only question is whether
+#    a link belongs to this checkout, and a directory or a link into somebody
+#    else's work is not ours to delete.
 if [ "$remove" = 1 ]; then
     removed=""
     for name in "$@"; do
@@ -81,15 +76,17 @@ if [ "$remove" = 1 ]; then
         link="$config_dir/$name"
         if [ -L "$link" ]; then
             target=$(readlink -- "$link")
+            allowed=0
             case "$target" in
-                "$extdir/$name"|"$extdir/$name"/*)
-                    rm -- "$link"
-                    echo "removed $link"
-                    ;;
-                *)
-                    fail "$link points at $target, not at this checkout's $name. Leaving it alone"
-                    ;;
+                "$extdir/$name"|"$extdir/$name"/*) allowed=1 ;;
             esac
+            if [ "$name" = "rex-extensions" ] && [ "$target" = "$here" ]; then allowed=1; fi
+            if [ "$allowed" = 1 ]; then
+                rm -- "$link"
+                echo "removed $link"
+            else
+                fail "$link points at $target, not at this checkout's $name. Leaving it alone"
+            fi
         elif [ -e "$link" ]; then
             fail "$link is not a symlink, so this installer did not make it. Move it aside yourself"
         else
@@ -115,7 +112,26 @@ if [ "$remove" = 1 ]; then
     exit 0
 fi
 
-# 2. The collection, and the extension each name resolves to. Every link is a
+# 3. What has to be there to install. Rex is not optional: without it these are
+#    modules nothing loads. A missing browser build is only a warning, because a
+#    pane opened before the build exists says so itself.
+command -v rex >/dev/null 2>&1 ||
+    fail "the rex command is not on PATH. See https://www.superlogical.com/rex/docs/installation"
+
+if [ "$#" -eq 0 ]; then
+    # The output is one name per line and the split is the point.
+    # shellcheck disable=SC2046
+    set -- $(every_extension)
+    [ "$#" -gt 0 ] || fail "$extdir has no extensions in it"
+fi
+
+selected=""
+for name in "$@"; do
+    [ -d "$extdir/$name" ] || fail "no extension called '$name' (this checkout has: $(every_extension | tr '\n' ' '))"
+    selected="$selected $name"
+done
+
+# 4. The collection, and the extension each name resolves to. Every link is a
 #    symlink so that `git pull` is the update, and none is forced over a
 #    directory: that one may be somebody's work.
 mkdir -p -- "$config_dir"
@@ -137,7 +153,7 @@ for name in $selected; do
     link_module "$extdir/$name" "$name"
 done
 
-# 3. The helpers. Each extension may ship bin/, and a name that two extensions
+# 5. The helpers. Each extension may ship bin/, and a name that two extensions
 #    both used would be a collision worth hearing about rather than losing.
 mkdir -p -- "$bindir"
 linked=""
@@ -161,7 +177,7 @@ if [ -d "$extdir/rex-ladybird" ] && [ -z "${LADYBIRD_BINARY:-}" ] && ! command -
     echo "                source build with terminal mode; set LADYBIRD_BINARY to its path." >&2
 fi
 
-# 4. Loading it. One line loads whatever is linked, so installing another
+# 6. Loading it. One line loads whatever is linked, so installing another
 #    extension later does not touch the file again. A line written by the
 #    single-extension installer is replaced, not left beside it: two setup calls
 #    would register every action twice.
@@ -199,7 +215,7 @@ else
     fi
 fi
 
-# 5. Tell the running server, if there is one. Not an error when there is not:
+# 7. Tell the running server, if there is one. Not an error when there is not:
 #    the next start reads the file anyway.
 rex config reload >/dev/null 2>&1 || echo "warning: rex config reload failed; run it by hand once Rex is running" >&2
 

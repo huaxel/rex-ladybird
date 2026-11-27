@@ -232,6 +232,41 @@ else
 fi
 
 echo
+echo "== --help prints the two directions and touches nothing"
+fresh_account
+if out=$(install_into --help 2>&1); then
+    pass "it succeeds"
+else
+    fail "it succeeds" "$out"
+fi
+case "$out" in
+    *"--remove"*) pass "it documents removal" ;;
+    *) fail "it documents removal" "$out" ;;
+esac
+expect_absent "$tmp/config/rex/rex-extensions" "nothing was linked"
+
+echo
+echo "== the collection's own link can be removed too"
+fresh_account
+install_into >/dev/null 2>&1 || fail "the install succeeded"
+install_into --remove rex-extensions >/dev/null 2>&1 || fail "the remove succeeded"
+expect_absent "$tmp/config/rex/rex-extensions" "the collection link is gone"
+expect_link "$tmp/config/rex/appearance" "$root/extensions/appearance" "the extensions stay linked"
+
+echo
+echo "== removal works without rex on PATH"
+fresh_account
+install_into >/dev/null 2>&1 || fail "the install succeeded"
+if env HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" PREFIX="$tmp/prefix" \
+    REX_CONFIG="$tmp/config/rex/init.lua" PATH=/usr/bin:/bin \
+    "$root/install.sh" --remove appearance >/dev/null 2>&1; then
+    pass "it succeeds"
+else
+    fail "it succeeds"
+fi
+expect_absent "$tmp/config/rex/appearance" "the link is gone"
+
+echo
 if [ "$failed" -ne 0 ]; then
     echo "some checks failed"
     exit 1
