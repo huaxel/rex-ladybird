@@ -14,7 +14,7 @@
 
 set -uo pipefail
 
-root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
 failed=0
 pass() { echo "  ok   $1"; }
 fail() {

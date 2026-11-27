@@ -255,7 +255,16 @@ so in the extension's `test/run.sh` and skip loudly rather than quietly.
 | restyle something | a block method (`set_theme`) | [`appearance`](../extensions/appearance/init.lua) |
 | open a full-window view | `new_split` + `zoom_block` | `M.tab_new` in [`rex-ladybird`](../extensions/rex-ladybird/init.lua) |
 | a program outside Rex that drives it | CLI + API | [`ladyctl`](../extensions/rex-ladybird/bin/ladyctl), [`rexchat`](../extensions/rexchat/bin/rexchat) |
-| one action asked in the app, answered to a caller | `rex.ui.pick` from a script with `rex do` | [`examples/native-question.lua`](../examples/native-question.lua) |
+
+To ask a question in the app and return the answer to a shell script, use `rex do`
+with a picker directly. This prints the selected ID as JSON without typing into a pane:
+
+```sh
+rex do -e 'local id, why = rex.ui.pick{title="Build target", items={{id="mac", title="Mac"}, {id="ios", title="iOS"}}}; return {choice=id, reason=why}' --json
+```
+
+A connected Rex app must answer the prompt. On cancellation, check `reason` rather
+than treating the missing choice as a default.
 
 ## Finding out what your Rex can do
 
