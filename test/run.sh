@@ -73,6 +73,9 @@ echo
 # --help is the cheapest proof that a helper still starts under this python.
 step "ladyctl --help" python3 extensions/rex-ladybird/bin/ladyctl --help
 step "rexchat --help" python3 extensions/rexchat/bin/rexchat --help
+# The fake cannot catch what only a real server refuses: the sandbox, its Lua
+# version, and whether a config file that loads the collection is accepted.
+step "live check" bash test/live_check.sh
 # The installer edits a file the user cannot lose, so its rollback is pinned.
 step "install.sh contract" bash test/install_test.sh
 
