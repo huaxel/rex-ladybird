@@ -77,8 +77,15 @@ step "rexchat --help" python3 extensions/rexchat/bin/rexchat --help
 # version, and whether a config file that loads the collection is accepted.
 step "live check" bash test/live_check.sh
 # The kitty-graphics examples parse terminal input by hand, so the parsing is pinned
-# against recorded SGR sequences rather than left to a mouse.
-step "kitty card hit-test" python3 examples/kitty-card/test_hybrid.py
+# against recorded SGR sequences rather than left to a mouse. The module reads
+# REX_BLOCK when it is imported, so outside a Rex pane there is nothing to run --
+# which is CI, and a plain shell.
+if [ -n "${REX_BLOCK:-}" ]; then
+    step "kitty card hit-test" python3 examples/kitty-card/test_hybrid.py
+else
+    echo "skip: the kitty card hit-test runs inside a Rex pane (REX_BLOCK is unset)"
+    echo
+fi
 # The installer edits a file the user cannot lose, so its rollback is pinned.
 step "install.sh contract" bash test/install_test.sh
 
