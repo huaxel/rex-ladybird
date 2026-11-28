@@ -45,6 +45,21 @@ missing. Nothing here is Rex drawing the controls — that is still the roadmap 
 also per-tab state: if the pane is closed before an answer, the agent waits forever, so
 give the poll a deadline.
 
+## Checking the click, not just its geometry
+
+The hit-test suite above works on recorded terminal input. The pane path — click,
+answer file, label — is checked by a script that opens the card for real, clicks it
+with the same SGR sequence a mouse sends, and closes the tab again:
+
+```sh
+python3 examples/kitty-card/test_click_live.py     # needs a running Rex and ImageMagick
+```
+
+It reads the choice's position from `card.py`'s own `buttons()`, so the check cannot
+drift from the program it checks, and it skips when there is no Rex pane to open a
+card in. Verified here: the file arrives as `{"id", "title", "block_id"}` and the
+label becomes `chose: Ship it`.
+
 ## What Rex answered when asked directly
 
 Sent from inside a pane, on Rex 0.1.0-preview.23 (macOS client 0.1.0-snapshot.2182):
