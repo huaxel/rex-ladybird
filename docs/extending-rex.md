@@ -166,8 +166,8 @@ out of what already exists:
 So when an idea needs a picker that stays on screen until answered, a native
 question widget, or a form, it is a Rex feature proposal rather than an extension:
 two implementations, a contract for stale answers, and a rule that an older client
-must not answer on the user's behalf. `extensions/rexchat/docs/native-choice-block.md`
-is that kind of proposal, kept next to the extension whose problem it grew out of.
+must not answer on the user's behalf. [`native-choice-block.md`](native-choice-block.md)
+is that kind of proposal.
 
 ## The server API, and block methods
 
@@ -297,6 +297,7 @@ so in the extension's `test/run.sh` and skip loudly rather than quietly.
 | a palette-only action with no key | `rex.action` alone | [`appearance`](../extensions/appearance/init.lua) |
 | restyle something | a block method (`set_theme`) | [`appearance`](../extensions/appearance/init.lua) |
 | open a full-window view | `new_split` + `zoom_block` | `M.tab_new` in [`rex-ladybird`](../extensions/rex-ladybird/init.lua) |
+| a question that outlives a tab switch | a card pane + an answer file | [`ask.lua`](../examples/kitty-card/ask.lua) |
 | a program outside Rex that drives it | CLI + API | [`ladyctl`](../extensions/rex-ladybird/bin/ladyctl), [`rexchat`](../extensions/rexchat/bin/rexchat) |
 
 To ask a question in the app and return the answer to a shell script, use `rex do`
@@ -308,6 +309,18 @@ rex do -e 'local id, why = rex.ui.pick{title="Build target", items={{id="mac", t
 
 A connected Rex app must answer the prompt. On cancellation, check `reason` rather
 than treating the missing choice as a default.
+
+That prompt is modal: it pauses the action and closes on the first answer. When the
+question should stay visible while you keep working — or be answered on another device
+later — open a card pane instead and let the answer arrive as a file:
+
+```sh
+rex do examples/kitty-card/ask.lua --action ask \
+  question='Ship the split view?' choices='yes=Ship it|no=Wait' answer=/tmp/answer.json --json
+```
+
+The action returns at once with `answer_file`; the click writes
+`{"id", "title", "block_id"}` there and sets the pane's label.
 
 ## Finding out what your Rex can do
 

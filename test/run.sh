@@ -76,6 +76,9 @@ step "rexchat --help" python3 extensions/rexchat/bin/rexchat --help
 # The fake cannot catch what only a real server refuses: the sandbox, its Lua
 # version, and whether a config file that loads the collection is accepted.
 step "live check" bash test/live_check.sh
+# The kitty-graphics examples parse terminal input by hand, so the parsing is pinned
+# against recorded SGR sequences rather than left to a mouse.
+step "kitty card hit-test" python3 examples/kitty-card/test_hybrid.py
 # The installer edits a file the user cannot lose, so its rollback is pinned.
 step "install.sh contract" bash test/install_test.sh
 
