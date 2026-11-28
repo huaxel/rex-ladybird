@@ -158,12 +158,25 @@ bash test/run.sh
 ```
 
 The runner checks the scope trap (`test/scope_check.py` rejects a name read above the
-`local` that declares it), the module list (`test/manifest_check.py`), the collection
-module itself, then each extension's `test/run.sh`, shellcheck, the Python helpers, and
-the installer against a temporary account. `LUA_BIN` points it at a Lua 5.1 interpreter
-if `luajit`, `lua5.1` or `lua` is not on your `PATH`; it also looks in the nix store,
-because a skipped suite that reads as green is worse than a slow lookup. CI runs the
-same script on Linux and macOS.
+`local` that declares it), the module list (`test/manifest_check.py`), the relative links
+between the READMEs (`test/links_check.py`), the collection module itself, then each
+extension's `test/run.sh`, shellcheck, the Python helpers, and the installer against a
+temporary account. `LUA_BIN` points it at a Lua 5.1 interpreter if `luajit`, `lua5.1` or
+`lua` is not on your `PATH`; it also looks in the nix store, because a skipped suite that
+reads as green is worse than a slow lookup.
+
+Almost all of that runs against `test/fake_rex.lua`, which has no sandbox and is not Rex.
+`test/live_check.sh` loads the collection in a real server and has `rex config check`
+accept a config that uses it; it skips loudly when no server answers, so CI runs the fake
+alone and a machine with Rex on it checks the whole thing:
+
+```sh
+bash test/live_check.sh     # loads the collection in the running Rex, read-only
+bash test/run.sh            # the same script CI runs
+```
+
+CI runs `test/run.sh` on Linux and macOS. A suite that cannot run there skips rather than
+pretends: the launcher's needs a live server, and says so.
 
 ## Platform
 
