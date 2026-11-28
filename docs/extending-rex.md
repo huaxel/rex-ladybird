@@ -132,6 +132,43 @@ local pane, err = rex.session.new_split{
 - Everything returns `(result, err)` and returns `nil, err` rather than raising, so a
   pane that could not be created is a message you write, not a traceback in the palette.
 
+## Blocks are typed, and the types are not yours
+
+A block is not a rectangle of terminal — it is an instance of a **flavor** provided
+by a **creator**, and the flavor decides what the block is and what it can do. On
+this machine there are three creators and four flavors:
+
+```text
+com.superlogical.terminal   shell    shell, command, args, login, interactive, cwd,
+                                     path_prepend, size, theme, initial_input, exit
+com.superlogical.tunnel     dial     host, port, client_address
+                            listen   address, port, client_target
+com.superlogical.onboarding onboarding step
+```
+
+`rex api call block_creator.list` prints that with each option's schema, and
+`session.describe_block` prints one block's methods, events and actions. The
+options *are* the interface: `initial_input` types something at a shell's prompt,
+`command` runs a program there, `exit` decides what happens when it ends.
+
+**A Lua extension cannot add a creator or a flavor, and no API pretends otherwise:**
+the script global has `session`, `block`, `layout`, `action`, `ui`, `exec` and the
+rest, but nothing that registers a block type, and the server exposes
+`block_creator.list` alone. A new flavor is a change to the server *and* to every
+client that must draw it — which is why the interesting extensions here are built
+out of what already exists:
+
+- a **program in a shell block** is a new pane type without a new flavor
+  (`rex-ladybird` runs a browser, `tui-launcher` runs whatever you picked);
+- a **client** is a whole app against the same API (`ladyctl`, `rexchat`);
+- an **action** is a new verb over blocks that already exist.
+
+So when an idea needs a picker that stays on screen until answered, a native
+question widget, or a form, it is a Rex feature proposal rather than an extension:
+two implementations, a contract for stale answers, and a rule that an older client
+must not answer on the user's behalf. `extensions/rexchat/docs/native-choice-block.md`
+is that kind of proposal, kept next to the extension whose problem it grew out of.
+
 ## The server API, and block methods
 
 Two calls cover most of it:
@@ -186,7 +223,11 @@ network.
 ## Events, scripts and clients
 
 - **Scripts**: `rex do path/to/script.lua` runs a file with the same `rex` API, and
-  `rex.args` holds the `key=value` arguments. A script that registers `rex.on`
+  `rex.args` holds the `key=value` arguments. `rex.after(seconds, fn)` and
+  `rex.every(seconds, fn)` schedule work — but **not during `rex.sleep`**: a script
+  that slept to let a timer fire measured zero callbacks, because a pause is not
+  the script running. Wait on an event with `rex.wait` instead of sleeping on a
+  timer. A script that registers `rex.on`
   handlers keeps running and receives events (`--all` for every session), pausing with
   `rex.sleep(seconds)` and `rex.wait(event, filter, timeout)` until `rex.stop(code)`.
   This is how you watch Rex rather than react to a key. See `rex do --help`.
@@ -278,6 +319,28 @@ rex do --help                  # the Lua API, scripts, rex.on, rex.args
 rex actions --json             # every action, with its arguments
 rex api list                   # every server method, grouped, block methods included
 rex api describe session.new_split
+rex api call block_creator.list # the block flavors this server can make, and their options
 rex keymap                     # what each key does, and which line bound it
 rex config check               # does the config load, and what did it define
 ```
+
+## Pixels or cells
+
+A pane is a terminal, and Rex answers the protocol questions a graphics program asks:
+`\x1b_Gi=31…a=q` comes back `OK`, so the Kitty graphics protocol is available from any
+pane. That makes an in-pane app with real buttons possible without a native window, an
+overlay, or an accessibility permission — `examples/kitty-card/card.py` is one, and it
+writes its answer back through `session.set_block_label`.
+
+The cost decides when to use it. Measured here on Rex 0.1.0-preview.23:
+
+| what is redrawn | per frame |
+| --- | --- |
+| the same pane as text cells (80×24) | 1,971 bytes, under a millisecond |
+| the same pane as pixels, quarter scale | 0.54 MB, 0.38 s |
+| the same pane as pixels, full scale | 8.71 MB, 0.93 s |
+
+Kitty has no "shift the image up one line", so every scroll is a full repaint. Pixels
+suit what changes rarely — a card, a decision, an image, a status strip — and cells suit
+anything that scrolls, gets selected, copied, or read by a screen reader. A chat view
+wants cells for the transcript and pixels only for the chrome.
