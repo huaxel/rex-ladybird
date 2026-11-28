@@ -45,11 +45,14 @@ local function known(name)
   return false
 end
 
--- `require` fails the same way whether a module is missing or broken. A missing
--- one is expected when the collection was installed partially; anything else is
--- that extension's own error and is reported as it is.
-local function missing(error_message)
-  return type(error_message) == "string" and error_message:find("not found", 1, true) ~= nil
+-- `require` fails the same way whether the extension is missing or broken. Only
+-- the first is ordinary, when the collection was installed partially, so the
+-- match is on *this* module's name: an extension that is present but whose own
+-- dependency is missing says "module 'dep' not found" and must be reported, not
+-- skipped. Skipping it would hide a broken install behind a working one.
+local function missing(error_message, name)
+  return type(error_message) == "string"
+    and error_message:find("module '" .. name .. "' not found", 1, true) ~= nil
 end
 
 local function load(name, settings)
@@ -81,19 +84,28 @@ function M.setup(opts)
     end
   end
 
-  local skipped = {}
+  local loaded, skipped = {}, {}
   for _, name in ipairs(wanted) do
-    if not M.loaded[name] then
+    if M.loaded[name] then
+      loaded[#loaded + 1] = name   -- loaded by an earlier setup call
+    else
       local module, err = load(name, M.options.options[name])
       if module == nil then
-        if explicit or not missing(err) then raise(err) end
+        if not missing(err, name) then raise(err) end
+        if explicit then
+          raise("rex extension not installed: " .. name
+            .. " (link it with ./install.sh " .. name .. ")")
+        end
         skipped[#skipped + 1] = name
       else
         M.loaded[name] = module
+        loaded[#loaded + 1] = name
       end
     end
   end
-  return { loaded = wanted, skipped = skipped }
+  -- `loaded` is what actually loaded: a name that was asked for and skipped is
+  -- in `skipped`, not here, or a partial install looks complete.
+  return { loaded = loaded, skipped = skipped }
 end
 
 return M

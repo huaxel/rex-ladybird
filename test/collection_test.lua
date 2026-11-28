@@ -88,4 +88,58 @@ do
   t.check("the action list is unchanged", table.concat(action_names(), " ") == first, table.concat(action_names(), " "))
 end
 
+
+--- Missing and broken ------------------------------------------------
+
+t.section("a partially installed collection skips what is absent, loudly nowhere else")
+do
+  -- A collection whose list names two extensions: one that is not there, and
+  -- one that is there but needs a module nobody has. The first is ordinary when
+  -- the installer linked a subset; the second is a broken install and must
+  -- raise, or a quarter of the collection silently stops existing.
+  local function fixture(list, files)
+    local dir = (os.getenv("TMPDIR") or "/tmp"):gsub("/+$", "") .. "/rex-ext-fixture." .. tostring(os.time())
+      .. tostring(math.random(1000, 9999))
+    os.execute("mkdir -p '" .. dir .. "/extensions'")
+    for name, body in pairs(files or {}) do
+      os.execute("mkdir -p '" .. dir .. "/extensions/" .. name .. "'")
+      local file = assert(io.open(dir .. "/extensions/" .. name .. "/init.lua", "w"))
+      file:write(body)
+      file:close()
+    end
+    local source = io.open(repo .. "/init.lua", "r")
+    local body = source:read("*a")
+    source:close()
+    local rewritten = body:gsub("local MODULES = {[^}]*}", "local MODULES = { " .. list .. " }", 1)
+    local out = assert(io.open(dir .. "/init.lua", "w"))
+    out:write(rewritten)
+    out:close()
+    return dir
+  end
+
+  local absent = "no-such-extension-anywhere"
+  local dir = fixture('"' .. absent .. '"', {})
+  local C = dofile(dir .. "/init.lua")
+  local result = C.setup{}
+  t.check("an absent extension is skipped, not fatal", #result.skipped == 1 and result.skipped[1] == absent,
+    table.concat(result.skipped, ", "))
+  t.check("and it is not reported as loaded", #result.loaded == 0, #result.loaded)
+
+  local broken_dir = fixture('"broken"', {
+    broken = 'local dep = require("missing-dependency")\nreturn { setup = function() end }\n',
+  })
+  local Broken = dofile(broken_dir .. "/init.lua")
+  local raised = t.error_of(Broken.setup, {})
+  t.check("an extension whose dependency is missing raises", raised ~= nil, raised)
+  t.check("and the message names the missing dependency",
+    raised ~= nil and raised:find("missing%-dependency") ~= nil, raised)
+
+  local named = t.error_of(C.setup, { extensions = { absent } })
+  t.check("naming an uninstalled extension says how to install it",
+    named ~= nil and named:find("not installed", 1, true) ~= nil and named:find("install.sh", 1, true) ~= nil,
+    named)
+
+  os.execute("rm -rf '" .. dir .. "' '" .. broken_dir .. "'")
+end
+
 t.done()
